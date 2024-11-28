@@ -19,10 +19,16 @@
       inputs.uv2nix.follows = "uv2nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+      };
+    };
   };
 
 
-  outputs = { nixpkgs, flake-utils, pyproject-nix, uv2nix, pyproject-build-systems, ... }:
+  outputs = { nixpkgs, flake-utils, pyproject-nix, uv2nix, pyproject-build-systems, rust-overlay, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let pkgs = import nixpkgs {
             inherit system;
@@ -31,6 +37,7 @@
               allowUnfree = true;
               cudaSupport = true;
             };
+            overlays = [(import rust-overlay)];
           };
           workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
           pythonSet = pkgs.callPackage ./nix/uv-python.nix {inherit pyproject-nix pyproject-build-systems workspace;}; in
