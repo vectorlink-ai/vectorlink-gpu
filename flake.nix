@@ -1,32 +1,44 @@
 {
   inputs = {
-    nixpkgs.url = "github:nixOS/nixpkgs?ref=nixpkgs-unstable";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs = {
-        nixpkgs.follows = "nixpkgs";
-      };
+    nixpkgs.url = "github:nixOS/nixpkgs?ref=nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+    pyproject-nix = {
+      url = "github:pyproject-nix/pyproject.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    uv2nix = {
+      url = "github:pyproject-nix/uv2nix";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    pyproject-build-systems = {
+      url = "github:pyproject-nix/build-system-pkgs";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.uv2nix.follows = "uv2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, rust-overlay }:(
-    let
-      supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
-      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
-      nixpkgsFor = forAllSystems (system:
-        (import nixpkgs) {
-          inherit system;
-          overlays = [
-            (import rust-overlay)
-          ];
-        }
-      ); in
+
+  outputs = { nixpkgs, flake-utils, pyproject-nix, uv2nix, pyproject-build-systems, ... }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let pkgs = import nixpkgs {
+            inherit system;
+
+            config = {
+              allowUnfree = true;
+              cudaSupport = true;
+            };
+          };
+          workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
+          pythonSet = pkgs.callPackage ./nix/uv-python.nix {inherit pyproject-nix pyproject-build-systems workspace;}; in
       {
-        devShells = forAllSystems (system :
-          let pkgs = nixpkgsFor.${system};in
-          {
-            default = pkgs.callPackage ./shell.nix {};
-          });
+        devShells = {
+          #default = pkgs.callPackage ./nix/shell.nix {inherit python3-base; };
+          default = pkgs.callPackage ./nix/uv-shell.nix {inherit workspace pythonSet;};
+        };
       }
   );
 }
