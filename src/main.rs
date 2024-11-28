@@ -1,5 +1,12 @@
 use tch::Tensor;
 
+pub fn comparison_out(out: &Tensor, candidates: &Tensor, query: &Tensor) -> Tensor {
+    candidates
+        .matmul_out(&out, &query)
+        .sub_scalar_out(&out, 1.0)
+        .div_scalar_out(&out, -2.0)
+}
+
 fn main() {
     let vectors: Vec<f32> = vec![
         0.0, 1.0, // 0
@@ -11,7 +18,7 @@ fn main() {
         -0.707, 0.707, // 6
         -0.707, -0.707, // 7
     ];
-    // neighborhood size 2
+    // neighborhood size  2
     let neighborhoods: Vec<i64> = vec![
         4, 6, // 0
         4, 5, // 1
@@ -46,6 +53,12 @@ fn main() {
     eprintln!("------");
     let queue_distance_t: Tensor = (1.0 - candidates_t.mm(&q_t)) / 2.0;
     queue_distance_t.print();
+
+    eprintln!("xxxxxxx");
+    let out = queue_distance_t.zeros_like();
+    let queue_distance_2_t: Tensor = comparison_out(&out, &candidates_t, &q_t);
+    queue_distance_2_t.print();
+
     eprintln!("dimensions: {}", queue_distance_t.size()[0]);
     let k = i64::min(3, queue_distance_t.size()[0] as i64);
     let (vals, idxes) = queue_distance_t.topk(k, 0, false, true);
