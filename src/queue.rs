@@ -1,17 +1,14 @@
-use tch::{Device, Kind, Tensor};
+use tch::{Kind, Tensor};
 
-struct Queue {
+pub struct Queue {
     length: i64,
     indices: Tensor,
     distances: Tensor,
 }
 
-pub fn device() -> Device {
-    Device::Cpu
-}
-
 impl Queue {
     pub fn new(length: i64, capacity: i64) -> Queue {
+        assert!(capacity >= length);
         // This is annoying, but u32 scalars using Tensor::full appear not to work.
         let indices = Tensor::from_slice(&vec![i32::MAX; capacity as usize]);
         let distances = Tensor::from_slice(&vec![f32::MAX; capacity as usize]);
@@ -20,6 +17,22 @@ impl Queue {
             indices,
             distances,
         }
+    }
+
+    pub fn new_from(length: i64, capacity: i64, init_queue: &Queue) -> Queue {
+        assert!(length >= init_queue.length);
+        let queue = Queue::new(length, capacity);
+        let len = init_queue.len() as i64;
+        queue
+            .indices
+            .narrow(0, 0, len)
+            .copy_(&queue.indices.narrow(0, 0, len));
+        queue
+            .distances
+            .narrow(0, 0, len)
+            .copy_(&queue.distances.narrow(0, 0, len));
+
+        queue
     }
 
     pub fn insert(&mut self, vector_ids: &Tensor, distances: &Tensor) -> bool {
@@ -68,10 +81,12 @@ impl Queue {
             self.distances.narrow(0, 0, new_size).copy_(&new_distances);
         }
 
-        self.indices
+        let _ = self
+            .indices
             .narrow(0, new_size, capacity - new_size)
             .fill_(i32::MAX as i64);
-        self.distances
+        let _ = self
+            .distances
             .narrow(0, new_size, capacity - new_size)
             .fill_(f32::MAX as f64);
 
@@ -79,7 +94,7 @@ impl Queue {
     }
 
     pub fn len(&self) -> i32 {
-        let mask = (self.indices.eq(i32::MAX as i64));
+        let mask = self.indices.eq(i32::MAX as i64);
         let result = Vec::<i32>::try_from(mask.nonzero().flatten(0, 1)).unwrap();
         result[0]
     }
@@ -110,6 +125,19 @@ impl Queue {
             }
         }
         eprintln!(" ]");
+    }
+
+    pub fn pop_n_ids(&mut self, n: i64) -> Tensor {
+        let len = self.len();
+        let take = std::cmp::min(len as i64, n);
+        let mut indices = self.indices.narrow(0, 0, take);
+        let mut distances = self.distances.narrow(0, 0, take);
+        let copied_indices = indices.copy();
+
+        let _ = indices.fill_(i32::MAX as i64);
+        let _ = distances.fill_(f32::MAX as f64);
+
+        copied_indices
     }
 }
 
