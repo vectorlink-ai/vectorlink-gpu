@@ -23,7 +23,10 @@ pub fn search_from_seeds(
     _search_params: &SearchParams,
 ) -> (Tensor, Tensor) {
     // TODO primes
-    let neighborhoods = neighborhoods.index_select(0, neighbor_indices);
+    let mut neighborhoods = neighborhoods.index_select(0, neighbor_indices);
+    let out_of_band_neighbors = neighborhoods.eq(i32::MAX as i64);
+    // ensure we have no out of band neighbors. they would mess up index selects below.
+    let _ = neighborhoods.masked_fill_(&out_of_band_neighbors, 0);
     let neighborhood_vectors = vectors.index_select(0, &neighborhoods);
     let distances = comparison(&neighborhood_vectors, query_vec);
     let flat_neighbors = neighborhoods.flatten(0, -1);
@@ -107,6 +110,16 @@ pub fn search_from_initial(
     search_layers(layers, query_vec, &mut search_queue, vectors, search_params);
 
     search_queue
+}
+
+pub fn generate_circulant_neighborhoods(
+    number_of_vectors: usize,
+    neighborhood_size: usize,
+    primes: &Tensor,
+) -> Tensor {
+    let indices = Tensor::arange(number_of_vectors, (Kind::Int, primes.device()));
+
+    todo!();
 }
 
 fn main() {
