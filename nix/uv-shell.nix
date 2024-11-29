@@ -6,7 +6,7 @@ let editableOverlay = workspace.mkEditablePyprojectOverlay {
       # members = [ "hello-world" ];
     };
     editablePythonSet = pythonSet.overrideScope editableOverlay;
-    virtualenv = editablePythonSet.mkVirtualEnv "hello-dev-env" workspace.deps.all; in
+    virtualenv = editablePythonSet.mkVirtualEnv "torch-experiment-dev-env" workspace.deps.all; in
 mkShell {
   packages = [
     virtualenv
