@@ -112,12 +112,16 @@ pub fn search_from_initial(
     search_queue
 }
 
-pub fn generate_circulant_neighborhoods(
-    number_of_vectors: usize,
-    neighborhood_size: usize,
-    primes: &Tensor,
-) -> Tensor {
+pub fn generate_circulant_neighborhoods(number_of_vectors: i64, primes: &Tensor) -> Tensor {
     let indices = Tensor::arange(number_of_vectors, (Kind::Int, primes.device()));
+    let neighborhood_size = primes.size1().unwrap();
+    let repeated_indices = indices
+        .expand([neighborhood_size, number_of_vectors], true)
+        .transpose(0, 1);
+    let repeated_primes = primes.expand([number_of_vectors, neighborhood_size], true);
+
+    let circulant_neighbors = (repeated_indices + repeated_primes).remainder(number_of_vectors);
+    let circulant_neighbors = circulant_neighbors.sort(1, false);
 
     todo!();
 }
