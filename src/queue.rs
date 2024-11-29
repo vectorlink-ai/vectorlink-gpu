@@ -22,7 +22,8 @@ impl Queue {
         }
     }
 
-    pub fn insert(&mut self, vector_ids: &Tensor, distances: &Tensor) {
+    pub fn insert(&mut self, vector_ids: &Tensor, distances: &Tensor) -> bool {
+        let buffer = self.indices.narrow_copy(0, 0, self.length);
         let capacity = self.indices.size1().unwrap();
         let vector_ids_length = vector_ids.size1().unwrap();
         let distances_length = distances.size1().unwrap();
@@ -38,6 +39,7 @@ impl Queue {
 
         // sort indices first
         let (sorted_index_values, sorted_index_indices) = self.indices.sort(0, false);
+
         self.indices.copy_(&sorted_index_values);
         self.distances
             .copy_(&self.distances.index_select(0, &sorted_index_indices));
@@ -47,7 +49,8 @@ impl Queue {
         let candidate_indices = &self.indices.index_select(0, &sort_indices);
 
         // remove duplicates
-        let (unique_indices, inverse, counts) = candidate_indices.unique_consecutive(true, true, 0);
+        let (unique_indices, inverse, _counts) =
+            candidate_indices.unique_consecutive(true, true, 0);
         let device = self.indices.device();
         let perm = Tensor::arange(inverse.size1().unwrap(), (Kind::Int64, device));
         let inverse = inverse.flip([0]);
@@ -58,14 +61,21 @@ impl Queue {
 
         let new_distances = candidate_distances.index_select(0, &map);
         let new_size = new_distances.size1().unwrap();
-        self.indices.narrow(0, 0, new_size).copy_(&unique_indices);
-        self.distances.narrow(0, 0, new_size).copy_(&new_distances);
+        let did_something = buffer.narrow(0, 0, new_size) != unique_indices;
+        if did_something {
+            let mut indices_window = self.indices.narrow(0, 0, new_size);
+            indices_window.copy_(&unique_indices);
+            self.distances.narrow(0, 0, new_size).copy_(&new_distances);
+        }
+
         self.indices
             .narrow(0, new_size, capacity - new_size)
             .fill_(i32::MAX as i64);
         self.distances
             .narrow(0, new_size, capacity - new_size)
             .fill_(f32::MAX as f64);
+
+        did_something
     }
 
     pub fn len(&self) -> i32 {
@@ -79,7 +89,7 @@ impl Queue {
         eprint!("Queue[ ");
         let indices = Vec::<i32>::try_from(&self.indices).unwrap();
         let distances = Vec::<f32>::try_from(&self.distances).unwrap();
-        let found_boundary = false;
+
         let length = self.len();
         for i in 0..size as usize {
             if i == length as usize {
@@ -152,7 +162,7 @@ mod tests {
         let (distances, indices) = distances.sort_stable(true, 0, false);
         let vector_ids = vector_ids.index_select(0, &indices);
 
-        let (vector_ids, inverse, counts) = vector_ids.unique_consecutive(true, false, 0);
+        let (vector_ids, inverse, _counts) = vector_ids.unique_consecutive(true, false, 0);
         let perm = Tensor::arange(inverse.size1().unwrap(), (Kind::Int, device()));
         let inverse = inverse.flip([0]);
         let perm = perm.flip([0]);
@@ -198,5 +208,34 @@ mod tests {
         queue.print();
         eprintln!("len: {}", queue.len());
         panic!();
+    }
+
+    #[test]
+    fn tensor_equality() {
+        let vector_ids1 = Tensor::from_slice::<i32>(&[3, 0, 1]);
+        let vector_ids2 = Tensor::from_slice::<i32>(&[3, 0, 1]);
+        assert!(vector_ids1 == vector_ids2);
+    }
+
+    #[test]
+    fn did_something() {
+        let length = 6;
+        let capacity = 12;
+        let mut queue = Queue::new(length, capacity);
+        let vector_ids = Tensor::from_slice::<i32>(&[3, 0, 1]);
+        let distances = Tensor::from_slice::<f32>(&[0.5, 1.0, 0.8]);
+        let did_something = queue.insert(&vector_ids, &distances);
+        eprintln!("did_something: {did_something}");
+
+        let vector_ids = Tensor::from_slice::<i32>(&[3, 0, 1]);
+
+        let distances = Tensor::from_slice::<f32>(&[0.5, 1.0, 0.8]);
+        let did_something = queue.insert(&vector_ids, &distances);
+        assert!(!did_something);
+
+        let vector_ids = Tensor::from_slice::<i32>(&[3, 2, 5]);
+        let distances = Tensor::from_slice::<f32>(&[0.5, 3.0, 9.8]);
+        let did_something = queue.insert(&vector_ids, &distances);
+        assert!(did_something);
     }
 }
