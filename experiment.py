@@ -30,6 +30,36 @@ class Queue:
         print(self.distances.narrow(1, self.length, dim))
 
 
+def comparison(qvs, nvs):
+    print(nvs)
+    batch_size, queue_size, vector_dim = nvs.size()
+    return (1 - nvs.bmm(qvs.resize(batch_size, 1, vector_dim).transpose(1, 2))) / 2
+
+
+def search_from_seeds(
+    query_vecs: Tensor,
+    neighborhood_indices: Tensor,
+    neighborhoods: Tensor,
+    vectors: Tensor,
+):
+    (dim1, dim2) = neighborhood_indices.size()
+    (batch_size, nhs) = neighborhoods.size()
+    (_, vector_dimension) = vectors.size()
+
+    index_list = neighborhoods.index_select(0, neighborhood_indices.flatten()).flatten()
+    indexes_of_comparisons = index_list.view(dim1, dim2 * nhs)
+    vectors_for_comparison = vectors.index_select(0, index_list).view(
+        dim1, dim2 * nhs, vector_dimension
+    )
+    # return (query_vecs, vectors_for_comparison)
+    distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
+    return (indexes_of_comparisons, distances_from_comparison)
+
+
+def closest_vectors():
+    pass
+
+
 def punch_out_duplicates(ids: Tensor, distances: Tensor):
     dim1, dim2 = ids.size()
     shifted_ids = torch.hstack([ids[:, 1:], torch.full([dim1, 1], MAXINT)])
@@ -110,7 +140,7 @@ def distances(vs: Tensor, neighborhoods: Tensor):
     qvi = torch.arange(dim1)
     qvs = vs.index_select(0, qvi).t().reshape(dim1, vec_dim, 1)
     nvs = vs.index_select(0, neighborhoods.flatten()).view(dim1, dim2, vec_dim)
-    return (1 - nvs.bmm(qvs).resize(dim1, dim2)) / 2
+    return comparison(qvs, nvs)
 
 
 def prune(neighborhood: Tensor, neighborhood_distances: Tensor, vectors: Tensor):
@@ -134,12 +164,6 @@ def generate_circulant_neighborhoods(num_vecs: Tensor, primes: Tensor):
 
 def generate_hnsw():
     """ """
-    pass
-
-
-def search_from_seeds(
-    query_batch,
-):
     pass
 
 
