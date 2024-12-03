@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from torch import Tensor
 import torch
 import sys
@@ -21,13 +21,24 @@ class Queue:
         indices_head.copy_(queue.indices.narrow(1, 0, head_length))
         distances_head.copy_(queue.distances.narrow(1, 0, head_length))
 
-    def insert(self, vector_id_batch: Tensor, distances_batch: Tensor):
+    def insert(
+        self,
+        vector_id_batch: Tensor,
+        distances_batch: Tensor,
+        exclude: Optional[Tensor] = None,  # formatted like [[0],[1],[2]]
+    ):
         bufs = torch.narrow_copy(self.indices, 1, 0, self.length)
         (batches, size_per_batch) = vector_id_batch.size()
         indices_tail = self.indices.narrow(1, self.length, size_per_batch)
         distances_tail = self.distances.narrow(1, self.length, size_per_batch)
         indices_tail.copy_(vector_id_batch)
         distances_tail.copy_(distances_batch)
+
+        if not exclude is None:
+            exclude_mask = indices_tail == exclude.expand(batches, size_per_batch)
+            indices_tail[exclude_mask] = MAXINT
+            distances_tail[exclude_mask] = MAXFLOAT
+
         (self.indices, self.distances) = queue_sort(self.indices, self.distances)
         did_something_mask = self.indices.narrow(1, 0, self.length) != bufs
         return did_something_mask
@@ -133,7 +144,7 @@ def closest_vectors(
         )
         # Search queue
         did_something = search_queue.insert(
-            indexes_of_comparisons, distances_of_comparisons
+            indexes_of_comparisons, distances_of_comparisons, exclude=exclude
         )
         # Visit queue setup
         print(f"indexes_of_comparisons size: {indexes_of_comparisons.size()}")
