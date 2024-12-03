@@ -43,13 +43,14 @@ class Queue:
         did_something_mask = self.indices.narrow(1, 0, self.length) != bufs
         return did_something_mask
 
-    def print(self):
+    def print(self, tail: Optional[bool] = False):
         (_bs, dim) = self.size()
         print(self.indices.narrow(1, 0, self.length))
         print(self.distances.narrow(1, 0, self.length))
-        print("----------------")
-        print(self.indices.narrow(1, self.length, dim - self.length))
-        print(self.distances.narrow(1, self.length, dim - self.length))
+        if tail:
+            print("----------------")
+            print(self.indices.narrow(1, self.length, dim - self.length))
+            print(self.distances.narrow(1, self.length, dim - self.length))
 
     def pop_n_ids(self, n: int):
         length = self.length
@@ -66,7 +67,6 @@ class Queue:
 
 
 def comparison(qvs, nvs):
-    print(nvs)
     batch_size, queue_size, vector_dim = nvs.size()
     results = (1 - nvs.bmm(qvs.resize(batch_size, 1, vector_dim).transpose(1, 2))) / 2
     return results.resize(batch_size, queue_size)
@@ -79,17 +79,12 @@ def search_from_seeds(
     vectors: Tensor,
 ):
     (batch_size, visit_length) = neighbors_to_visit.size()
-    print(f"batch size: {batch_size}, visit_length: {visit_length}")
     (_, neighborhood_size) = neighborhoods.size()
     (_, vector_dimension) = vectors.size()
 
     filter_mask = neighbors_to_visit == MAXINT
     neighbors_to_visit[filter_mask] = 0  # set to 0 to get a valid element
-    print("==neighbors to visit with stuff punched out")
-    print(neighbors_to_visit)
     index_list = neighborhoods.index_select(0, neighbors_to_visit.flatten()).flatten()
-    print("index list")
-    print(index_list)
     indexes_of_comparisons = index_list.view(
         batch_size, visit_length * neighborhood_size
     )
@@ -99,8 +94,6 @@ def search_from_seeds(
     # return (query_vecs, vectors_for_comparison)
     distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
 
-    print("indexes of comparisons before punchout")
-    print(indexes_of_comparisons)
     expanded_filter_mask = (
         filter_mask.reshape(batch_size, visit_length, 1)
         .expand(batch_size, visit_length, neighborhood_size)
@@ -131,24 +124,26 @@ def closest_vectors(
     did_something = torch.full([batch_size], True)
     seen = exclude
     while torch.any(did_something):
-        print("visit_queue")
-        visit_queue.print()
+        # visit_queue.print()
         neighbors_to_visit = visit_queue.pop_n_ids(PARALLEL_VISIT_COUNT)
-        print("neighbors_to_visit")
-        print(neighbors_to_visit)
         (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
             query_vecs,
             neighbors_to_visit,
             neighborhoods,
             vectors,
         )
+        print("===RETURN indexes and distances from comparison===")
+        print(indexes_of_comparisons)
+        print(distances_of_comparisons)
         # Search queue
+        print("BEFORE")
+        search_queue.print()
         did_something = search_queue.insert(
             indexes_of_comparisons, distances_of_comparisons, exclude=exclude
         )
+        print("AFTER")
+        search_queue.print()
         # Visit queue setup
-        print(f"indexes_of_comparisons size: {indexes_of_comparisons.size()}")
-        print(f"seen size: {seen.size()}")
         mask = rowwise_isin(indexes_of_comparisons, seen)
         # mask = torch.isin(indexes_of_comparisons, seen)
         indexes_of_comparisons[mask] = MAXINT
@@ -187,7 +182,6 @@ def shrink_to_fit(seen):
     (values, _) = values.sort()
     max_val_mask = values == MAXINT
     nonzeroes = torch.nonzero(torch.all(max_val_mask, dim=0))
-    print(f"nonzero size: {nonzeroes.size()}")
     if nonzeroes.size() == (0, 0):
         return seen
     max_col = nonzeroes[0].item()
@@ -204,6 +198,7 @@ def punch_out_duplicates(ids: Tensor, distances: Tensor):
     return index_sort(ids, distances)
 
 
+# Does not appear to be stable :(
 def index_by_tensor(a: Tensor, b: Tensor):
     dim1, dim2 = a.size()
     a = a[
@@ -217,7 +212,7 @@ def index_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
 
     nds = index_by_tensor(neighborhood_distances, indices)
 
-    (nds, indices) = nds.sort(stable=True)
+    (nds, indices) = nds.sort(dim=1, stable=True)
 
     ns = index_by_tensor(ns, indices)
 
@@ -259,7 +254,7 @@ def example_db():
     )
 
     neighborhoods = torch.tensor(
-        [[4, 6], [4, 5], [6, 7], [5, 7], [0, 1], [1, 3], [2, 0], [2, 3]],
+        [[4, 6], [4, 5], [6, 7], [5, 7], [0, 1], [1, 3], [0, 2], [2, 3]],
         dtype=torch.int32,
     )
 
@@ -273,10 +268,14 @@ def two_hop(ns: Tensor):
 
 def distances(vs: Tensor, neighborhoods: Tensor):
     _, vec_dim = vs.size()
-    dim1, dim2 = neighborhoods.size()
-    qvi = torch.arange(dim1)
-    qvs = vs.index_select(0, qvi).t().reshape(dim1, vec_dim, 1)
-    nvs = vs.index_select(0, neighborhoods.flatten()).view(dim1, dim2, vec_dim)
+    number_of_vectors, neighborhood_size = neighborhoods.size()
+    query_vector_indices = torch.arange(number_of_vectors)
+    qvs = vs.index_select(0, query_vector_indices).reshape(
+        number_of_vectors, vec_dim, 1
+    )
+    nvs = vs.index_select(0, neighborhoods.flatten()).view(
+        number_of_vectors, neighborhood_size, vec_dim
+    )
     return comparison(qvs, nvs)
 
 
@@ -385,7 +384,7 @@ def generate_hnsw():
 
 
 NEIGHBORHOOD_QUEUE_FACTOR = 3
-CAGRA_LOOPS = 3
+CAGRA_LOOPS = 1
 
 
 def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
@@ -394,7 +393,8 @@ def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
     (_, neighborhood_size) = neighborhoods.size()
     neighborhood_distances = distances(vectors, neighborhoods)
     queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
-    remaining_capacity = max(neighborhood_size * PARALLEL_VISIT_COUNT, queue_length)
+    # we want to be able to add a 'big' neighborhood at the end, which happens to be queue_length
+    remaining_capacity = queue_length * PARALLEL_VISIT_COUNT
     queue = Queue(
         num_vecs,
         queue_length,
@@ -409,8 +409,10 @@ def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
     exclude = torch.arange(num_vecs).unsqueeze(1)
     for i in range(0, CAGRA_LOOPS):
         closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
-        neighborhoods = queue.indices.narrow_copy(1, 0, neighborhood_size)
-    return neighborhoods
+        print(f"cagra loop {i}")
+        queue.print()
+        neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
+    return neighborhoods.narrow(1, 0, neighborhood_size)
 
 
 """
