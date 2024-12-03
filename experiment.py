@@ -14,6 +14,13 @@ class Queue:
         self.indices = torch.full((num_queues, capacity), MAXINT)
         self.distances = torch.full((num_queues, capacity), MAXFLOAT)
 
+    def initialize_from_queue(self, queue):
+        head_length = min(queue.length, self.length)
+        indices_head = self.indices.narrow(1, 0, head_length)
+        distances_head = self.distances.narrow(1, 0, head_length)
+        indices_head.copy_(queue.indices.narrow(1, 0, head_length))
+        distances_head.copy_(queue.distances.narrow(1, 0, head_length))
+
     def insert(self, vector_id_batch: Tensor, distances_batch: Tensor):
         bufs = torch.narrow_copy(self.indices, 1, 0, self.length)
         (batches, size_per_batch) = vector_id_batch.size()
@@ -61,13 +68,17 @@ def search_from_seeds(
     vectors: Tensor,
 ):
     (dim1, dim2) = neighbors_to_visit.size()
-    (batch_size, nhs) = neighborhoods.size()
+    (batch_size, neighborhood_size) = neighborhoods.size()
     (_, vector_dimension) = vectors.size()
 
-    index_list = neighborhoods.index_select(0, neighbors_to_visit.flatten()).flatten()
-    indexes_of_comparisons = index_list.view(dim1, dim2 * nhs)
+    filtered_indices = neighbors_to_visit.flatten()
+    filtered_indices = filtered_indices[filtered_indices != MAXINT]
+    index_list = neighborhoods.index_select(0, filtered_indices).flatten()
+    print("index list")
+    print(index_list)
+    indexes_of_comparisons = index_list.view(dim1, dim2 * neighborhood_size)
     vectors_for_comparison = vectors.index_select(0, index_list).view(
-        dim1, dim2 * nhs, vector_dimension
+        dim1, dim2 * neighborhood_size, vector_dimension
     )
     # return (query_vecs, vectors_for_comparison)
     distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
@@ -86,10 +97,15 @@ def closest_vectors(
     (batch_size, queue_capacity) = search_queue.size()
     capacity = VISIT_QUEUE_LEN + extra_capacity
     visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
+    visit_queue.initialize_from_queue(search_queue)
     did_something = torch.full([batch_size], True)
     seen = torch.empty([batch_size, 0])
     while torch.any(did_something):
+        print("visit_queue")
+        visit_queue.print()
         neighbors_to_visit = visit_queue.pop_n_ids(PARALLEL_VISIT_COUNT)
+        print("neighbors_to_visit")
+        print(neighbors_to_visit)
         (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
             query_vecs,
             neighbors_to_visit,
