@@ -113,7 +113,7 @@ def closest_vectors(
     search_queue: Queue,
     vectors: Tensor,
     neighborhoods: Tensor,
-    exclude: Tensor,
+    exclude: Optional[Tensor] = None,
 ):
     (neighborhood_count, neighborhood_size) = neighborhoods.size()
     extra_capacity = neighborhood_size * PARALLEL_VISIT_COUNT
@@ -122,7 +122,7 @@ def closest_vectors(
     visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
     visit_queue.initialize_from_queue(search_queue)
     did_something = torch.full([batch_size], True)
-    seen = exclude
+    seen = exclude if exclude is not None else torch.empty(batch_size, 0)
     while torch.any(did_something):
         # visit_queue.print()
         neighbors_to_visit = visit_queue.pop_n_ids(PARALLEL_VISIT_COUNT)
@@ -132,17 +132,10 @@ def closest_vectors(
             neighborhoods,
             vectors,
         )
-        print("===RETURN indexes and distances from comparison===")
-        print(indexes_of_comparisons)
-        print(distances_of_comparisons)
         # Search queue
-        print("BEFORE")
-        search_queue.print()
         did_something = search_queue.insert(
             indexes_of_comparisons, distances_of_comparisons, exclude=exclude
         )
-        print("AFTER")
-        search_queue.print()
         # Visit queue setup
         mask = rowwise_isin(indexes_of_comparisons, seen)
         # mask = torch.isin(indexes_of_comparisons, seen)
@@ -182,7 +175,9 @@ def shrink_to_fit(seen):
     (values, _) = values.sort()
     max_val_mask = values == MAXINT
     nonzeroes = torch.nonzero(torch.all(max_val_mask, dim=0))
-    if nonzeroes.size() == (0, 0):
+    # print(nonzeroes.size())
+    # print(nonzeroes.size()[0])
+    if nonzeroes.size()[0] == 0:
         return seen
     max_col = nonzeroes[0].item()
     max_col = max_col - 1 if max_col > 0 else 0
@@ -400,17 +395,17 @@ def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
         queue_length,
         queue_length + remaining_capacity,
     )  # make que from neighborhoods + neigbhorhood_distances
-    queue.print()
-    print("neigbhorhoods")
-    print(neighborhoods)
-    print("neighborhood distances")
-    print(neighborhood_distances)
+    # queue.print()
+    # print("neigbhorhoods")
+    # print(neighborhoods)
+    # print("neighborhood distances")
+    # print(neighborhood_distances)
     queue.insert(neighborhoods, neighborhood_distances)
     exclude = torch.arange(num_vecs).unsqueeze(1)
     for i in range(0, CAGRA_LOOPS):
         closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
         print(f"cagra loop {i}")
-        queue.print()
+        # queue.print()
         neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
     return neighborhoods.narrow(1, 0, neighborhood_size)
 
@@ -443,3 +438,33 @@ def rowwise_isin(tensor_1, target_tensor):
     result = torch.sum(matches, dim=2, dtype=torch.bool)
 
     return result
+
+
+def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
+    (batch_size, _) = vectors.size()
+    extra_capacity = max(queue_size, PARALLEL_VISIT_COUNT * neighborhood_size)
+    queue = Queue(batch_size, queue_size, queue_size + extra_capacity)
+    p = primes(queue_size)
+    initial_queue_indices = generate_circulant_neighborhoods(batch_size, p)
+    d = distances(vectors, initial_queue_indices)
+    queue.insert(initial_queue_indices, d)
+
+    return queue
+
+
+def recall_test(
+    number_of_vectors: int, dimensions: int = 1535, neighborhood_size: int = 24
+):
+    vectors = torch.nn.functional.normalize(
+        torch.randn(number_of_vectors, dimensions), dim=1
+    )
+    neighborhoods = generate_ann(primes(24), vectors)
+    queue = initial_queue(vectors, neighborhood_size, 3 * neighborhood_size)
+
+    closest_vectors(vectors, queue, vectors, neighborhoods)
+    expected = torch.arange(number_of_vectors)
+    actual = queue.indices.t()[0]
+    found = (expected == actual).sum().item()
+
+    print(found)
+    print(found / number_of_vectors)
