@@ -105,7 +105,11 @@ VISIT_QUEUE_LEN = 24 * 3
 
 
 def closest_vectors(
-    query_vecs: Tensor, search_queue: Queue, vectors: Tensor, neighborhoods: Tensor
+    query_vecs: Tensor,
+    search_queue: Queue,
+    vectors: Tensor,
+    neighborhoods: Tensor,
+    exclude: Tensor,
 ):
     (neighborhood_count, neighborhood_size) = neighborhoods.size()
     extra_capacity = neighborhood_size * PARALLEL_VISIT_COUNT
@@ -114,7 +118,7 @@ def closest_vectors(
     visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
     visit_queue.initialize_from_queue(search_queue)
     did_something = torch.full([batch_size], True)
-    seen = torch.empty([batch_size, 0])
+    seen = exclude
     while torch.any(did_something):
         print("visit_queue")
         visit_queue.print()
@@ -147,8 +151,11 @@ def closest_vectors(
 def search_layers(
     layers: List[Tensor], query_vecs: Tensor, search_queue: Queue, vectors: Tensor
 ):
+    (number_of_batches, _) = query_vecs.size()
+    # we don't exclude everything, since we're starting from actual query vecs, not indices
+    exclude = torch.empty(number_of_batches, 0)
     for layer in layers:
-        closest_vectors(query_vecs, search_queue, vectors)
+        closest_vectors(query_vecs, search_queue, vectors, layer, exclude)
 
 
 def search_from_initial():
@@ -388,8 +395,9 @@ def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
     print("neighborhood distances")
     print(neighborhood_distances)
     queue.insert(neighborhoods, neighborhood_distances)
+    exclude = torch.arange(num_vecs).unsqueeze(1)
     for i in range(0, CAGRA_LOOPS):
-        closest_vectors(vectors, queue, vectors, neighborhoods)
+        closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
         neighborhoods = queue.indices.narrow_copy(1, 0, neighborhood_size)
     return neighborhoods
 
