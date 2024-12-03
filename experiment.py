@@ -13,13 +13,15 @@ class Queue:
         self.distances = torch.full((num_queues, capacity), MAXFLOAT)
 
     def insert(self, vector_id_batch: Tensor, distances_batch: Tensor):
-        buf = torch.narrow_copy(self.indices, 1, 0, self.length)
+        bufs = torch.narrow_copy(self.indices, 1, 0, self.length)
         (batches, nhs) = vector_id_batch.size()
         indices_tail = self.indices.narrow(1, self.length, nhs)
         distances_tail = self.distances.narrow(1, self.length, nhs)
         indices_tail.copy_(vector_id_batch)
         distances_tail.copy_(distances_batch)
         (self.indices, self.distances) = queue_sort(self.indices, self.distances)
+        did_something_mask = self.indices.narrow(1, 0, self.length) != bufs
+        return did_something_mask
 
     def print(self):
         (_bs, dim) = self.indices.size()
@@ -28,6 +30,16 @@ class Queue:
         print("----------------")
         print(self.indices.narrow(1, self.length, dim))
         print(self.distances.narrow(1, self.length, dim))
+
+    def pop_n_ids(self, n: int):
+        length = self.length
+        take = min(length, n)
+        indices = self.indices.narrow(0, 0, take)
+        distances = self.distances.narrow(0, 0, take)
+        copied_indices = indices.copy()
+        indices.fill(MAXINT)
+        distances.fill(MAXFLOAT)
+        return copied_indices
 
 
 def comparison(qvs, nvs):
@@ -38,15 +50,15 @@ def comparison(qvs, nvs):
 
 def search_from_seeds(
     query_vecs: Tensor,
-    neighborhood_indices: Tensor,
+    neighbors_to_visit: Tensor,
     neighborhoods: Tensor,
     vectors: Tensor,
 ):
-    (dim1, dim2) = neighborhood_indices.size()
+    (dim1, dim2) = neighbors_to_visit.size()
     (batch_size, nhs) = neighborhoods.size()
     (_, vector_dimension) = vectors.size()
 
-    index_list = neighborhoods.index_select(0, neighborhood_indices.flatten()).flatten()
+    index_list = neighborhoods.index_select(0, neighbors_to_visit.flatten()).flatten()
     indexes_of_comparisons = index_list.view(dim1, dim2 * nhs)
     vectors_for_comparison = vectors.index_select(0, index_list).view(
         dim1, dim2 * nhs, vector_dimension
@@ -56,8 +68,62 @@ def search_from_seeds(
     return (indexes_of_comparisons, distances_from_comparison)
 
 
-def closest_vectors():
+PARALLEL_VISIT_COUNT = 3
+VISIT_QUEUE_LEN = 24 * 3
+
+
+def closest_vectors(
+    query_vecs: Tensor, search_queue: Queue, vectors: Tensor, neighborhoods: Tensor
+):
+    (neighborhood_count, neighborhood_size) = neighborhoods.size()
+    extra_capacity = neighborhood_size * PARALLEL_VISIT_COUNT
+    (batch_size, queue_capacity) = search_queue.size()
+    capacity = VISIT_QUEUE_LEN + extra_capacity
+    visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
+    did_something = torch.full(batch_size, True)
+    seen = torch.empty([batch_size, 0])
+    while torch.any(did_something):
+        neighbors_to_visit = visit_queue.pop_n_ids(PARALLEL_VISIT_COUNT)
+        (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
+            query_vecs,
+            neighbors_to_visit,
+        )
+        # Search queue
+        did_something = search_queue.insert(
+            indexes_of_comparisons, distances_of_comparisons
+        )
+        # Visit queue setup
+        mask = torch.isin(indexes_of_comparisons, seen)
+        indexes_of_comparisons[mask] = MAXINT
+        distances_of_comparisons[mask] = MAXFLOAT
+
+        visit_queue.insert(indexes_of_comparisons, distances_of_comparisons)
+
+        seen = add_new_to_seen(seen, indexes_of_comparisons)
+
+
+def search_layers(
+    layers: [Tensor], query_vecs: Tensor, search_queue: Queue, vectors: Tensor
+):
     pass
+
+
+def add_new_to_seen(seen, indices):
+    seen = torch.concat([seen, indices])
+    return shrink_to_fit(seen)
+
+
+def shrink_to_fit(seen):
+    (values, _) = seen.sort()
+    (dim1, dim2) = seen.size()
+    shifted = torch.hstack([values[:, 1:], torch.full([dim1, 1], MAXINT)])
+    mask = values == shifted
+    values[mask] = MAXINT
+    (values, _) = values.sort()
+    max_val_mask = values == MAXINT
+    max_col = torch.nonzero(torch.all(max_val_mask))[0].item()
+    max_col = max_col - 1 if max_col > 0 else 0
+    return seen.narrow(1, 0, max_col)
 
 
 def punch_out_duplicates(ids: Tensor, distances: Tensor):
