@@ -43,8 +43,8 @@ class Queue:
     def pop_n_ids(self, n: int):
         length = self.length
         take = min(length, n)
-        indices = self.indices.narrow(0, 0, take)
-        distances = self.distances.narrow(0, 0, take)
+        indices = self.indices.narrow(1, 0, take)
+        distances = self.distances.narrow(1, 0, take)
         copied_indices = indices.clone()
         indices.fill_(MAXINT)
         distances.fill_(MAXFLOAT)
@@ -67,21 +67,36 @@ def search_from_seeds(
     neighborhoods: Tensor,
     vectors: Tensor,
 ):
-    (dim1, dim2) = neighbors_to_visit.size()
-    (batch_size, neighborhood_size) = neighborhoods.size()
+    (batch_size, visit_length) = neighbors_to_visit.size()
+    print(f"batch size: {batch_size}, visit_length: {visit_length}")
+    (_, neighborhood_size) = neighborhoods.size()
     (_, vector_dimension) = vectors.size()
 
-    filtered_indices = neighbors_to_visit.flatten()
-    filtered_indices = filtered_indices[filtered_indices != MAXINT]
-    index_list = neighborhoods.index_select(0, filtered_indices).flatten()
+    filter_mask = neighbors_to_visit == MAXINT
+    neighbors_to_visit[filter_mask] = 0  # set to 0 to get a valid element
+    print("==neighbors to visit with stuff punched out")
+    print(neighbors_to_visit)
+    index_list = neighborhoods.index_select(0, neighbors_to_visit.flatten()).flatten()
     print("index list")
     print(index_list)
-    indexes_of_comparisons = index_list.view(dim1, dim2 * neighborhood_size)
+    indexes_of_comparisons = index_list.view(
+        batch_size, visit_length * neighborhood_size
+    )
     vectors_for_comparison = vectors.index_select(0, index_list).view(
-        dim1, dim2 * neighborhood_size, vector_dimension
+        batch_size, visit_length * neighborhood_size, vector_dimension
     )
     # return (query_vecs, vectors_for_comparison)
     distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
+
+    print("indexes of comparisons before punchout")
+    print(indexes_of_comparisons)
+    expanded_filter_mask = (
+        filter_mask.reshape(batch_size, visit_length, 1)
+        .expand(batch_size, visit_length, neighborhood_size)
+        .reshape(batch_size, visit_length * neighborhood_size)
+    )
+    indexes_of_comparisons[expanded_filter_mask] = MAXINT
+    distances_from_comparison[expanded_filter_mask] = MAXFLOAT
     return (indexes_of_comparisons, distances_from_comparison)
 
 
@@ -117,7 +132,10 @@ def closest_vectors(
             indexes_of_comparisons, distances_of_comparisons
         )
         # Visit queue setup
-        mask = torch.isin(indexes_of_comparisons, seen)
+        print(f"indexes_of_comparisons size: {indexes_of_comparisons.size()}")
+        print(f"seen size: {seen.size()}")
+        mask = rowwise_isin(indexes_of_comparisons, seen)
+        # mask = torch.isin(indexes_of_comparisons, seen)
         indexes_of_comparisons[mask] = MAXINT
         distances_of_comparisons[mask] = MAXFLOAT
 
@@ -138,7 +156,7 @@ def search_from_initial():
 
 
 def add_new_to_seen(seen, indices):
-    seen = torch.concat([seen, indices])
+    seen = torch.concat([seen, indices], dim=1)
     return shrink_to_fit(seen)
 
 
@@ -150,7 +168,11 @@ def shrink_to_fit(seen):
     values[mask] = MAXINT
     (values, _) = values.sort()
     max_val_mask = values == MAXINT
-    max_col = torch.nonzero(torch.all(max_val_mask))[0].item()
+    nonzeroes = torch.nonzero(torch.all(max_val_mask, dim=0))
+    print(f"nonzero size: {nonzeroes.size()}")
+    if nonzeroes.size() == (0, 0):
+        return seen
+    max_col = nonzeroes[0].item()
     max_col = max_col - 1 if max_col > 0 else 0
     return seen.narrow(1, 0, max_col)
 
@@ -214,11 +236,13 @@ def example_db():
             [0.707, -0.707],  # 5
             [-0.707, 0.707],  # 6
             [-0.707, -0.707],  # 7
-        ]
+        ],
+        dtype=torch.float32,
     )
 
     neighborhoods = torch.tensor(
-        [[4, 6], [4, 5], [6, 7], [5, 7], [0, 1], [1, 3], [2, 0], [2, 3]]
+        [[4, 6], [4, 5], [6, 7], [5, 7], [0, 1], [1, 3], [2, 0], [2, 3]],
+        dtype=torch.int32,
     )
 
     return (vs, neighborhoods)
@@ -389,3 +413,12 @@ qvst = qvs.t().reshape(8, 2, 1)
 thv.bmm(qvst)
 
 """
+
+
+def rowwise_isin(tensor_1, target_tensor):
+    matches = tensor_1.unsqueeze(2) == target_tensor.unsqueeze(1)
+
+    # result: boolean tensor of shape (N, K) where result[n, k] is torch.isin(tensor_1[n, k], target_tensor[n])
+    result = torch.sum(matches, dim=2, dtype=torch.bool)
+
+    return result
