@@ -1,22 +1,24 @@
+from typing import List
 from torch import Tensor
 import torch
 import sys
 
-MAXINT = sys.maxsize
-MAXFLOAT = 10.0
+MAXINT = 99
+MAXFLOAT = 99.0
 
 
 class Queue:
     def __init__(self, num_queues: int, queue_length: int, capacity: int):
+        assert queue_length < capacity
         self.length = queue_length
         self.indices = torch.full((num_queues, capacity), MAXINT)
         self.distances = torch.full((num_queues, capacity), MAXFLOAT)
 
     def insert(self, vector_id_batch: Tensor, distances_batch: Tensor):
         bufs = torch.narrow_copy(self.indices, 1, 0, self.length)
-        (batches, nhs) = vector_id_batch.size()
-        indices_tail = self.indices.narrow(1, self.length, nhs)
-        distances_tail = self.distances.narrow(1, self.length, nhs)
+        (batches, size_per_batch) = vector_id_batch.size()
+        indices_tail = self.indices.narrow(1, self.length, size_per_batch)
+        distances_tail = self.distances.narrow(1, self.length, size_per_batch)
         indices_tail.copy_(vector_id_batch)
         distances_tail.copy_(distances_batch)
         (self.indices, self.distances) = queue_sort(self.indices, self.distances)
@@ -24,28 +26,32 @@ class Queue:
         return did_something_mask
 
     def print(self):
-        (_bs, dim) = self.indices.size()
+        (_bs, dim) = self.size()
         print(self.indices.narrow(1, 0, self.length))
         print(self.distances.narrow(1, 0, self.length))
         print("----------------")
-        print(self.indices.narrow(1, self.length, dim))
-        print(self.distances.narrow(1, self.length, dim))
+        print(self.indices.narrow(1, self.length, dim - self.length))
+        print(self.distances.narrow(1, self.length, dim - self.length))
 
     def pop_n_ids(self, n: int):
         length = self.length
         take = min(length, n)
         indices = self.indices.narrow(0, 0, take)
         distances = self.distances.narrow(0, 0, take)
-        copied_indices = indices.copy()
-        indices.fill(MAXINT)
-        distances.fill(MAXFLOAT)
+        copied_indices = indices.clone()
+        indices.fill_(MAXINT)
+        distances.fill_(MAXFLOAT)
         return copied_indices
+
+    def size(self):
+        return self.indices.size()
 
 
 def comparison(qvs, nvs):
     print(nvs)
     batch_size, queue_size, vector_dim = nvs.size()
-    return (1 - nvs.bmm(qvs.resize(batch_size, 1, vector_dim).transpose(1, 2))) / 2
+    results = (1 - nvs.bmm(qvs.resize(batch_size, 1, vector_dim).transpose(1, 2))) / 2
+    return results.resize(batch_size, queue_size)
 
 
 def search_from_seeds(
@@ -80,13 +86,15 @@ def closest_vectors(
     (batch_size, queue_capacity) = search_queue.size()
     capacity = VISIT_QUEUE_LEN + extra_capacity
     visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
-    did_something = torch.full(batch_size, True)
+    did_something = torch.full([batch_size], True)
     seen = torch.empty([batch_size, 0])
     while torch.any(did_something):
         neighbors_to_visit = visit_queue.pop_n_ids(PARALLEL_VISIT_COUNT)
         (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
             query_vecs,
             neighbors_to_visit,
+            neighborhoods,
+            vectors,
         )
         # Search queue
         did_something = search_queue.insert(
@@ -103,8 +111,13 @@ def closest_vectors(
 
 
 def search_layers(
-    layers: [Tensor], query_vecs: Tensor, search_queue: Queue, vectors: Tensor
+    layers: List[Tensor], query_vecs: Tensor, search_queue: Queue, vectors: Tensor
 ):
+    for layer in layers:
+        closest_vectors(query_vecs, search_queue, vectors)
+
+
+def search_from_initial():
     pass
 
 
@@ -215,8 +228,88 @@ def prune(neighborhood: Tensor, neighborhood_distances: Tensor, vectors: Tensor)
     pass
 
 
-def primes():
-    return torch.tensor([1, 3, 7, 9])
+PRIMES = torch.tensor(
+    [
+        1,
+        2,
+        59063,
+        79193,
+        3,
+        5,
+        7,
+        11,
+        13,
+        17,
+        19,
+        23,
+        29,
+        31,
+        37,
+        41,
+        43,
+        47,
+        53,
+        59,
+        61,
+        67,
+        71,
+        73,
+        79,
+        83,
+        89,
+        97,
+        101,
+        103,
+        107,
+        109,
+        113,
+        127,
+        131,
+        137,
+        139,
+        149,
+        151,
+        157,
+        163,
+        167,
+        173,
+        179,
+        181,
+        191,
+        193,
+        197,
+        199,
+        211,
+        223,
+        227,
+        229,
+        233,
+        239,
+        241,
+        251,
+        257,
+        263,
+        269,
+        271,
+        277,
+        281,
+        283,
+        293,
+        307,
+        311,
+        313,
+        317,
+        331,
+        337,
+        347,
+        349,
+    ],
+    dtype=torch.int32,
+)
+
+
+def primes(size: int):
+    return PRIMES.narrow(0, 0, size)
 
 
 def generate_circulant_neighborhoods(num_vecs: Tensor, primes: Tensor):
@@ -233,14 +326,32 @@ def generate_hnsw():
     pass
 
 
-def generate_layer(primes: Tensor, vs: Tensor) -> Tensor:
-    (num_vecs, vec_dim) = vs.size()
-    nhi = generate_circulant_neighborhoods(num_vecs, primes)
-    (dim1, dim2) = nhi.size()
-    nhd = distances(vs, nhi)
+NEIGHBORHOOD_QUEUE_FACTOR = 3
+CAGRA_LOOPS = 3
 
-    nhv = vs.index_select(0, nhi.flatten()).resize(dim1, dim2)
-    pass
+
+def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
+    (num_vecs, vec_dim) = vectors.size()
+    neighborhoods = generate_circulant_neighborhoods(num_vecs, primes)
+    (_, neighborhood_size) = neighborhoods.size()
+    neighborhood_distances = distances(vectors, neighborhoods)
+    queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
+    remaining_capacity = max(neighborhood_size * PARALLEL_VISIT_COUNT, queue_length)
+    queue = Queue(
+        num_vecs,
+        queue_length,
+        queue_length + remaining_capacity,
+    )  # make que from neighborhoods + neigbhorhood_distances
+    queue.print()
+    print("neigbhorhoods")
+    print(neighborhoods)
+    print("neighborhood distances")
+    print(neighborhood_distances)
+    queue.insert(neighborhoods, neighborhood_distances)
+    for i in range(0, CAGRA_LOOPS):
+        closest_vectors(vectors, queue, vectors, neighborhoods)
+        neighborhoods = queue.indices.narrow_copy(1, 0, neighborhood_size)
+    return neighborhoods
 
 
 """
