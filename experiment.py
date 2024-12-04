@@ -5,6 +5,7 @@ from torch import profiler
 import sys
 from datetime import datetime
 import time
+import sys
 
 MAXINT = 99
 MAXFLOAT = 99.0
@@ -242,7 +243,12 @@ def shrink_to_fit(seen):
         (values, _) = values.sort()
         max_val_mask = values == MAXINT
         punched_mask = torch.all(max_val_mask, dim=0)
-        max_col = torch.arange(dim2)[punched_mask][0]
+        match_indices = torch.arange(dim2)[punched_mask]
+        (size,) = match_indices.size()
+        if size > 0:
+            max_col = torch.arange(dim2)[punched_mask][0]
+        else:
+            max_col = 0
         return values.narrow(1, 0, max_col)
 
 
@@ -557,6 +563,10 @@ def print_timestamp(msg):
 
 
 if __name__ == "__main__":
+
+    recall_test(2000)
+
+    sys.exit(0)
     with torch.no_grad():
         torch.set_default_device(DEVICE)
         torch.set_float32_matmul_precision("high")
