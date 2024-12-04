@@ -1,4 +1,4 @@
-{workspace, pythonSet, mkShell, uv, stdenv, lib, parquet-tools, rust-bin}:
+{workspace, pythonSet, mkShell, uv, stdenv, lib, parquet-tools, rust-bin, cudaPackages, linuxPackages}:
 let editableOverlay = workspace.mkEditablePyprojectOverlay {
       # Use environment variable
       root = "$REPO_ROOT";
@@ -22,6 +22,8 @@ mkShell {
     # Get repository root using git. This is expanded at runtime by the editable `.pth` machinery.
     #export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${lib.makeLibraryPath [stdenv.cc.cc]}"
     export REPO_ROOT=$(git rev-parse --show-toplevel)
+    export TRITON_LIBCUDA_PATH=${cudaPackages.cuda_cudart}/lib
+    export LIBRARY_PATH="${lib.makeLibraryPath [cudaPackages.cuda_cudart]}/stubs"
     export LIBTORCH_USE_PYTORCH=1
   '';
 }

@@ -1,10 +1,37 @@
 from typing import List, Optional
 from torch import Tensor
 import torch
+from torch import profiler
 import sys
+from datetime import datetime
+import time
 
 MAXINT = 99
 MAXFLOAT = 99.0
+DEVICE = "cuda"
+
+
+def timed(fn):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = fn()
+    end.record()
+    torch.cuda.synchronize()
+    return result, start.elapsed_time(end) / 1000
+
+
+# print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] {msg}")
+def log_time(func):
+    def wrapper(*args, **kwargs):
+        def closure():
+            return func(*args, **kwargs)
+
+        (result, time) = timed(closure)
+        # print(f"time spent: {time}")
+        return result
+
+    return wrapper
 
 
 class Queue:
@@ -67,9 +94,12 @@ class Queue:
 
 
 def comparison(qvs, nvs):
-    batch_size, queue_size, vector_dim = nvs.size()
-    results = (1 - nvs.bmm(qvs.resize(batch_size, 1, vector_dim).transpose(1, 2))) / 2
-    return results.resize(batch_size, queue_size)
+    with profiler.record_function("comparison"):
+        batch_size, queue_size, vector_dim = nvs.size()
+        results = (
+            1 - nvs.bmm(qvs.reshape(batch_size, 1, vector_dim).transpose(1, 2))
+        ) / 2
+        return results.reshape(batch_size, queue_size)
 
 
 def search_from_seeds(
@@ -77,31 +107,47 @@ def search_from_seeds(
     neighbors_to_visit: Tensor,
     neighborhoods: Tensor,
     vectors: Tensor,
+    preallocated_vector_batch: Tensor,
 ):
-    (batch_size, visit_length) = neighbors_to_visit.size()
-    (_, neighborhood_size) = neighborhoods.size()
-    (_, vector_dimension) = vectors.size()
+    with profiler.record_function("search_from_seeds"):
+        # print_timestamp("start of search_from_seeds")
+        (batch_size, visit_length) = neighbors_to_visit.size()
+        (_, neighborhood_size) = neighborhoods.size()
+        (_, vector_dimension) = vectors.size()
 
-    filter_mask = neighbors_to_visit == MAXINT
-    neighbors_to_visit[filter_mask] = 0  # set to 0 to get a valid element
-    index_list = neighborhoods.index_select(0, neighbors_to_visit.flatten()).flatten()
-    indexes_of_comparisons = index_list.view(
-        batch_size, visit_length * neighborhood_size
-    )
-    vectors_for_comparison = vectors.index_select(0, index_list).view(
-        batch_size, visit_length * neighborhood_size, vector_dimension
-    )
-    # return (query_vecs, vectors_for_comparison)
-    distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
+        # print_timestamp("making filter mask")
+        filter_mask = neighbors_to_visit == MAXINT
+        # print_timestamp("punchout")
+        neighbors_to_visit[filter_mask] = 0  # set to 0 to get a valid element
+        # print_timestamp("index select")
+        index_list = neighborhoods.index_select(
+            0, neighbors_to_visit.flatten()
+        ).flatten()
+        # print_timestamp("index view")
+        indexes_of_comparisons = index_list.view(
+            batch_size, visit_length * neighborhood_size
+        )
+        # print_timestamp("vectors")
+        # preallocated
 
-    expanded_filter_mask = (
-        filter_mask.reshape(batch_size, visit_length, 1)
-        .expand(batch_size, visit_length, neighborhood_size)
-        .reshape(batch_size, visit_length * neighborhood_size)
-    )
-    indexes_of_comparisons[expanded_filter_mask] = MAXINT
-    distances_from_comparison[expanded_filter_mask] = MAXFLOAT
-    return (indexes_of_comparisons, distances_from_comparison)
+        vectors_for_comparison = torch.index_select(
+            vectors, 0, index_list  # , out=preallocated_vector_batch
+        ).view(batch_size, visit_length * neighborhood_size, vector_dimension)
+        # print_timestamp("did index select")
+        # return (query_vecs, vectors_for_comparison)
+        # print_timestamp(" before compare")
+        distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
+        # print_timestamp(" after compare")
+
+        expanded_filter_mask = (
+            filter_mask.reshape(batch_size, visit_length, 1)
+            .expand(batch_size, visit_length, neighborhood_size)
+            .reshape(batch_size, visit_length * neighborhood_size)
+        )
+        indexes_of_comparisons[expanded_filter_mask] = MAXINT
+        distances_from_comparison[expanded_filter_mask] = MAXFLOAT
+        # print_timestamp("end of search_from_seeds")
+        return (indexes_of_comparisons, distances_from_comparison)
 
 
 PARALLEL_VISIT_COUNT = 3
@@ -115,36 +161,56 @@ def closest_vectors(
     neighborhoods: Tensor,
     exclude: Optional[Tensor] = None,
 ):
-    (neighborhood_count, neighborhood_size) = neighborhoods.size()
-    extra_capacity = neighborhood_size * PARALLEL_VISIT_COUNT
-    (batch_size, queue_capacity) = search_queue.size()
-    capacity = VISIT_QUEUE_LEN + extra_capacity
-    visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
-    visit_queue.initialize_from_queue(search_queue)
-    did_something = torch.full([batch_size], True)
-    seen = exclude if exclude is not None else torch.empty(batch_size, 0)
-    while torch.any(did_something):
-        # visit_queue.print()
-        neighbors_to_visit = visit_queue.pop_n_ids(PARALLEL_VISIT_COUNT)
-        (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
-            query_vecs,
-            neighbors_to_visit,
-            neighborhoods,
-            vectors,
-        )
-        # Search queue
-        did_something = search_queue.insert(
-            indexes_of_comparisons, distances_of_comparisons, exclude=exclude
-        )
-        # Visit queue setup
-        mask = rowwise_isin(indexes_of_comparisons, seen)
-        # mask = torch.isin(indexes_of_comparisons, seen)
-        indexes_of_comparisons[mask] = MAXINT
-        distances_of_comparisons[mask] = MAXFLOAT
+    with profiler.record_function("closest_vectors"):
+        # print_timestamp("start of closest vectors")
+        (_, vector_dimension) = vectors.size()
+        (neighborhood_count, neighborhood_size) = neighborhoods.size()
+        extra_capacity = neighborhood_size * PARALLEL_VISIT_COUNT
+        (batch_size, queue_capacity) = search_queue.size()
+        capacity = VISIT_QUEUE_LEN + extra_capacity
+        visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
+        visit_queue.initialize_from_queue(search_queue)
+        did_something = torch.full([batch_size], True)
+        seen = exclude if exclude is not None else torch.empty(batch_size, 0)
+        # preallocated_vector_batch = torch.empty(
+        #    (batch_size * PARALLEL_VISIT_COUNT * neighborhood_size, vector_dimension),
+        #    dtype=torch.float32,
+        # )
+        while torch.any(did_something):
+            # print_timestamp("start of loop")
+            # visit_queue.print()
+            neighbors_to_visit = visit_queue.pop_n_ids(PARALLEL_VISIT_COUNT)
+            (_, visit_length) = neighbors_to_visit.size()
+            narrow_to = batch_size * visit_length * neighborhood_size
+            # print_timestamp("popped")
+            (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
+                query_vecs,
+                neighbors_to_visit,
+                neighborhoods,
+                vectors,
+                None,
+                # preallocated_vector_batch.narrow(0, 0, narrow_to),
+            )
+            # print_timestamp("searched")
+            # Search queue
+            did_something = search_queue.insert(
+                indexes_of_comparisons, distances_of_comparisons, exclude=exclude
+            )
+            # print_timestamp("inserted in search queue")
+            # Visit queue setup
+            mask = rowwise_isin(indexes_of_comparisons, seen)
+            # print_timestamp("calculated mask")
+            # mask = torch.isin(indexes_of_comparisons, seen)
+            indexes_of_comparisons[mask] = MAXINT
+            distances_of_comparisons[mask] = MAXFLOAT
 
-        visit_queue.insert(indexes_of_comparisons, distances_of_comparisons)
+            visit_queue.insert(indexes_of_comparisons, distances_of_comparisons)
+            # print_timestamp("inserted in visit queue")
 
-        seen = add_new_to_seen(seen, indexes_of_comparisons)
+            seen = add_new_to_seen(seen, indexes_of_comparisons)
+            # print_timestamp("updated seen")
+            # print_timestamp("end of loop")
+        # print_timestamp("end of closest vectors")
 
 
 def search_layers(
@@ -167,56 +233,59 @@ def add_new_to_seen(seen, indices):
 
 
 def shrink_to_fit(seen):
-    (values, _) = seen.sort()
-    (dim1, dim2) = seen.size()
-    shifted = torch.hstack([values[:, 1:], torch.full([dim1, 1], MAXINT)])
-    mask = values == shifted
-    values[mask] = MAXINT
-    (values, _) = values.sort()
-    max_val_mask = values == MAXINT
-    nonzeroes = torch.nonzero(torch.all(max_val_mask, dim=0))
-    # print(nonzeroes.size())
-    # print(nonzeroes.size()[0])
-    if nonzeroes.size()[0] == 0:
-        return seen
-    max_col = nonzeroes[0].item()
-    max_col = max_col - 1 if max_col > 0 else 0
-    return seen.narrow(1, 0, max_col)
+    with profiler.record_function("shrink_to_fit"):
+        (values, _) = seen.sort()
+        (dim1, dim2) = seen.size()
+        shifted = torch.hstack([values[:, 1:], torch.full([dim1, 1], MAXINT)])
+        mask = values == shifted
+        values[mask] = MAXINT
+        (values, _) = values.sort()
+        max_val_mask = values == MAXINT
+        nonzeroes = torch.nonzero(torch.all(max_val_mask, dim=0))
+        # print(nonzeroes.size())
+        # print(nonzeroes.size()[0])
+        if nonzeroes.size()[0] == 0:
+            return seen
+        max_col = (nonzeroes[0].sum() - 1).clamp(min=0)
+        return seen.narrow(1, 0, max_col)
 
 
 def punch_out_duplicates(ids: Tensor, distances: Tensor):
-    dim1, dim2 = ids.size()
-    shifted_ids = torch.hstack([ids[:, 1:], torch.full([dim1, 1], MAXINT)])
-    mask = ids == shifted_ids
-    ids[mask] = MAXINT
-    distances[mask] = MAXFLOAT
-    return index_sort(ids, distances)
+    with profiler.record_function("punch_out_duplicates"):
+        dim1, dim2 = ids.size()
+        shifted_ids = torch.hstack([ids[:, 1:], torch.full([dim1, 1], MAXINT)])
+        mask = ids == shifted_ids
+        ids[mask] = MAXINT
+        distances[mask] = MAXFLOAT
+        return index_sort(ids, distances)
 
 
-# Does not appear to be stable :(
 def index_by_tensor(a: Tensor, b: Tensor):
-    dim1, dim2 = a.size()
-    a = a[
-        torch.arange(dim1).unsqueeze(1).expand((dim1, dim2)).flatten(), b.flatten()
-    ].view(dim1, dim2)
-    return a
+    with profiler.record_function("index_by_tensor"):
+        dim1, dim2 = a.size()
+        a = a[
+            torch.arange(dim1).unsqueeze(1).expand((dim1, dim2)).flatten(), b.flatten()
+        ].view(dim1, dim2)
+        return a
 
 
 def index_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
-    (ns, indices) = neighborhoods.sort(1)
+    with profiler.record_function("index_sort"):
+        (ns, indices) = neighborhoods.sort(1)
 
-    nds = index_by_tensor(neighborhood_distances, indices)
+        nds = index_by_tensor(neighborhood_distances, indices)
 
-    (nds, indices) = nds.sort(dim=1, stable=True)
+        (nds, indices) = nds.sort(dim=1, stable=True)
 
-    ns = index_by_tensor(ns, indices)
+        ns = index_by_tensor(ns, indices)
 
-    return (ns, nds)
+        return (ns, nds)
 
 
 def queue_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
-    (ns, nds) = index_sort(neighborhoods, neighborhood_distances)
-    return punch_out_duplicates(ns, nds)
+    with profiler.record_function("queue_sort"):
+        (ns, nds) = index_sort(neighborhoods, neighborhood_distances)
+        return punch_out_duplicates(ns, nds)
 
 
 """
@@ -357,6 +426,7 @@ PRIMES = torch.tensor(
         349,
     ],
     dtype=torch.int32,
+    device=DEVICE,
 )
 
 
@@ -383,10 +453,13 @@ CAGRA_LOOPS = 1
 
 
 def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
+    # print_timestamp("generating ann")
     (num_vecs, vec_dim) = vectors.size()
     neighborhoods = generate_circulant_neighborhoods(num_vecs, primes)
+    # print_timestamp("circulant neighborhoods generated")
     (_, neighborhood_size) = neighborhoods.size()
     neighborhood_distances = distances(vectors, neighborhoods)
+    # print_timestamp("distances calculated")
     queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
     # we want to be able to add a 'big' neighborhood at the end, which happens to be queue_length
     remaining_capacity = queue_length * PARALLEL_VISIT_COUNT
@@ -395,18 +468,23 @@ def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
         queue_length,
         queue_length + remaining_capacity,
     )  # make que from neighborhoods + neigbhorhood_distances
+    # print_timestamp("queue allocated")
     # queue.print()
     # print("neigbhorhoods")
     # print(neighborhoods)
     # print("neighborhood distances")
     # print(neighborhood_distances)
     queue.insert(neighborhoods, neighborhood_distances)
+    # print_timestamp("initial queue constructed from neighborhoods")
     exclude = torch.arange(num_vecs).unsqueeze(1)
     for i in range(0, CAGRA_LOOPS):
+        # print_timestamp(f"start of cagra loop {i}")
         closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
-        print(f"cagra loop {i}")
+        # print_timestamp(f" closest vectors calculated")
+        # print(f"cagra loop {i}")
         # queue.print()
         neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
+        # print_timestamp(f"end of cagra loop {i}")
     return neighborhoods.narrow(1, 0, neighborhood_size)
 
 
@@ -455,16 +533,52 @@ def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
 def recall_test(
     number_of_vectors: int, dimensions: int = 1535, neighborhood_size: int = 24
 ):
+    # print_timestamp("recall test starts")
     vectors = torch.nn.functional.normalize(
         torch.randn(number_of_vectors, dimensions), dim=1
     )
+    # print_timestamp("vectors allocated")
     neighborhoods = generate_ann(primes(24), vectors)
+    # print_timestamp("ann generated")
     queue = initial_queue(vectors, neighborhood_size, 3 * neighborhood_size)
+    # print_timestamp("queues allocated")
 
     closest_vectors(vectors, queue, vectors, neighborhoods)
+    # print_timestamp("closest vectors calculated")
     expected = torch.arange(number_of_vectors)
     actual = queue.indices.t()[0]
     found = (expected == actual).sum().item()
 
+    # print_timestamp("calculated recall")
+
     print(found)
     print(found / number_of_vectors)
+
+
+# Function to print timestamps
+def print_timestamp(msg):
+    pass
+
+
+if __name__ == "__main__":
+    with torch.no_grad():
+        torch.set_default_device(DEVICE)
+        torch.set_float32_matmul_precision("high")
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CUDA,
+                torch.profiler.ProfilerActivity.CPU,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                "./log", use_gzip=True
+            ),
+        ) as prof:
+            prof.step()
+            # with torch.profiler.record_function("recall_test"):
+            recall_test(2000)
+
+        # print(prof.key_averages().table())
+        # print(prof.key_averages().table(sort_by="self_cuda_time_total"))

@@ -1,4 +1,4 @@
-{pyproject-nix, pyproject-build-systems, cudaPackages, lib, workspace, python3, callPackage}:
+{pyproject-nix, pyproject-build-systems, cudaPackages, lib, workspace, python3, callPackage, glibc}:
 let overlay = workspace.mkPyprojectOverlay {
       # Prefer prebuilt binary wheels as a package source.
       # Sdists are less likely to "just work" because of the metadata missing from uv.lock.
@@ -44,6 +44,14 @@ rm -f $out/lib/python3.12/site-packages/nvidia/__pycache__/__init__.cpython-312.
       });
       pymeta3 = prev.pymeta3.overrideAttrs (p:{
         nativeBuildInputs = p.nativeBuildInputs ++ [final.setuptools];
+      });
+      triton = prev.triton.overrideAttrs (p:{
+        /*
+        postFixup = ''
+sed -i 's|/sbin/ldconfig|${glibc.bin}/bin/ldconfig|g' $out/lib/python3.12/site-packages/triton/backends/amd/driver.py
+sed -i 's|/sbin/ldconfig|${glibc.bin}/bin/ldconfig|g' $out/lib/python3.12/site-packages/triton/backends/nvidia/driver.py
+'';
+*/
       });
     };
 in
