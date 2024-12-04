@@ -8,7 +8,7 @@ import time
 
 MAXINT = 99
 MAXFLOAT = 99.0
-DEVICE = "cuda"
+DEVICE = "cpu"
 
 
 def timed(fn):
@@ -241,13 +241,9 @@ def shrink_to_fit(seen):
         values[mask] = MAXINT
         (values, _) = values.sort()
         max_val_mask = values == MAXINT
-        nonzeroes = torch.nonzero(torch.all(max_val_mask, dim=0))
-        # print(nonzeroes.size())
-        # print(nonzeroes.size()[0])
-        if nonzeroes.size()[0] == 0:
-            return seen
-        max_col = (nonzeroes[0].sum() - 1).clamp(min=0)
-        return seen.narrow(1, 0, max_col)
+        punched_mask = torch.all(max_val_mask, dim=0)
+        max_col = torch.arange(dim2)[punched_mask][0]
+        return values.narrow(1, 0, max_col)
 
 
 def punch_out_duplicates(ids: Tensor, distances: Tensor):
