@@ -66,7 +66,14 @@ F32_MAX = 99.9
 
 
 @cuda.jit(
-    "void(float32[:, :], int32[:, :], int32[:, :], float32[:, :], int32[:, :], float32[:, :])"
+    """
+void(float32[:, :],
+     int32[:, :],
+     int32[:, :],
+     float32[:, :],
+     int32[:, :],
+     float32[:, :])
+"""
 )
 def distance_from_seeds(
     query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
@@ -89,14 +96,16 @@ def distance_from_seeds(
 
     node_id = neighbors_to_visit[batch_idx, queue_idx]
     if node_id > vector_count:
-        index_out[batch_idx][queue_idx] = INT32_MAX
-        distance_out[batch_idx][queue_idx] = F32_MAX
+        if vector_idx == 0:
+            index_out[batch_idx][queue_idx] = INT32_MAX
+            distance_out[batch_idx][queue_idx] = F32_MAX
     else:
         neighbor_vector_id = neighborhoods[node_id, neighborhood_idx]
         vector = vectors[neighbor_vector_id]
         query_vector = query_vecs[batch_idx]
-        index_out[batch_idx][queue_idx] = neighbor_vector_id
-        distance_out[batch_idx][queue_idx] = cosine_distance(vector, query_vector)
+        if vector_idx == 0:
+            index_out[batch_idx][queue_idx] = neighbor_vector_id
+            distance_out[batch_idx][queue_idx] = cosine_distance(vector, query_vector)
 
 
 def do_dot_product():
