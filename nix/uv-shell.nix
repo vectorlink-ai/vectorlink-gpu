@@ -1,4 +1,4 @@
-{workspace, pythonSet, mkShell, uv, stdenv, lib, parquet-tools, rust-bin, cudaPackages, linuxPackages, cudatoolkit}:
+{workspace, pythonSet, mkShell, uv, stdenv, lib, parquet-tools, rust-bin, cudaPackages, linuxPackages, cudatoolkit, gdb}:
 let editableOverlay = workspace.mkEditablePyprojectOverlay {
       # Use environment variable
       root = "$REPO_ROOT";
@@ -15,6 +15,7 @@ mkShell {
     (rust-bin.stable.latest.default.override {
       extensions = [ "rust-src" "rust-analyzer" "clippy" ];
     })
+    gdb
   ];
   shellHook = ''
     # Undo dependency propagation by nixpkgs.
@@ -27,6 +28,7 @@ mkShell {
     export TRITON_LIBCUDA_PATH=${cudaPackages.cuda_cudart}/lib
     export LIBRARY_PATH="${lib.makeLibraryPath [cudaPackages.cuda_cudart]}/stubs"
     export LIBTORCH_USE_PYTORCH=1
+    export NUMBA_GDB_BINARY=${gdb}/bin/gdb
   '';
 }
 

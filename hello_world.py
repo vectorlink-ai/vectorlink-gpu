@@ -4,7 +4,7 @@ import taichi
 from taichi import types as ty
 
 import numpy as np
-from numba import cuda
+from numba import cuda, gdb_init
 
 
 @taichi.kernel
@@ -171,17 +171,20 @@ import experiment
 
 def run_cuda():
     (vecs, neighborhoods) = experiment.example_db()
-    qvs = vecs.index_select(0, torch.tensor([1, 3, 5]))
-    queue = torch.tensor([[0, 3], [4, 5], [6, 7]])
-    result = torch.empty(1, dtype=torch.float32)
+    qvs = vecs.index_select(0, torch.tensor([1, 3, 5], device="cuda"))
+    queue = torch.tensor([[0, 3], [4, 5], [6, 7]], device="cuda")
+    result = torch.empty(1, dtype=torch.float32, device="cuda")
     v1 = qvs[0]
     v2 = qvs[1]
 
     grid = (1, 1, 1)
     block = (2, 1, 1)
-    cosine_distance_kernel[grid, block, None, 4 * 2](v1, v2)
+    print(result)
+    cosine_distance_kernel[grid, block](v1, v2, numba.cuda.as_cuda_array(result))
+    print(result)
 
 
 if __name__ == "__main__":
     # main()
+    # gdb_init()
     run_cuda()

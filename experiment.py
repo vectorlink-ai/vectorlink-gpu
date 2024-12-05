@@ -367,6 +367,7 @@ def example_db():
             [-0.707, -0.707],  # 7
         ],
         dtype=torch.float32,
+        device="cuda",
     )
 
     neighborhoods = torch.tensor(
