@@ -1,7 +1,8 @@
 import torch
+import numba
 import taichi
 from taichi import types as ty
-import numba
+
 import numpy as np
 from numba import cuda
 
@@ -28,25 +29,38 @@ def distance(vector, query_vector, vector_idx):
 
 
 def sum_part(vec, scale, idx):
-    result = 0.0
     if idx < scale:
-        result += vec[idx + scale]
-    return result
+        vec[idx] += vec[idx + scale]
 
 
 def sum(vec, dim, idx):
     while dim > 32:
         dim /= 2
         sum_part(vec, dim, idx)
-
+    numba.cuda.syncthreads()
     result = 0.0
     if idx == 0:
-        for i in range(0, 32):
+        for i in range(0, dim):
             result += vec[i]
     return result
 
 
-def cosine_distance(vec1, vec2, out, vector_dimension, idx):
+@cuda.jit(
+    """
+void(float32[:],
+     float32[:],
+     float32[:]
+    )
+"""
+)
+def cosine_distance_kernel(vec1, vec2, out):
+    dimension = vec1.size[0]
+    vector_idx = cuda.blockDim.x * cuda.blockIdx.x + cuda.threadIdx.x
+    if vector_idx < dimension:
+        out[0] = cosine_distance(vec1, vec2, dimension, vector_idx)
+
+
+def cosine_distance(vec1, vec2, vector_dimension, idx):
     out[idx] = vec1[idx] * vec2[idx]
     numba.cuda.syncthreads()
     cos_theta = sum(out, vector_dimension, idx)
@@ -121,5 +135,22 @@ def main():
     print(do_dot_product())
 
 
+import experiment
+
+
+def run_cuda():
+    (vecs, neighborhoods) = experiment.example_db()
+    qvs = vecs.index_select(0, torch.tensor([1, 3, 5]))
+    queue = torch.tensor([[0, 3], [4, 5], [6, 7]])
+    result = torch.empty(1, dtype=torch.float32)
+    v1 = qvs[0]
+    v2 = qvs[1]
+
+    grid = (1, 1, 1)
+    block = (2, 1, 1)
+    cosine_distance[grid, block](v1, v2)
+
+
 if __name__ == "__main__":
-    main()
+    # main()
+    run_cuda()
