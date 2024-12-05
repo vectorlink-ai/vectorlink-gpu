@@ -54,16 +54,17 @@ void(float32[:],
 """
 )
 def cosine_distance_kernel(vec1, vec2, out):
+    scratch_buffer = numba.cuda.shared.array(2, cuda.float32)
     dimension = vec1.size[0]
     vector_idx = cuda.blockDim.x * cuda.blockIdx.x + cuda.threadIdx.x
     if vector_idx < dimension:
-        out[0] = cosine_distance(vec1, vec2, dimension, vector_idx)
+        out[0] = cosine_distance(vec1, vec2, scratch_buffer, dimension, vector_idx)
 
 
-def cosine_distance(vec1, vec2, vector_dimension, idx):
-    out[idx] = vec1[idx] * vec2[idx]
+def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
+    buf[idx] = vec1[idx] * vec2[idx]
     numba.cuda.syncthreads()
-    cos_theta = sum(out, vector_dimension, idx)
+    cos_theta = sum(buf, vector_dimension, idx)
     numba.cuda.syncthreads()
     result = 0.0
     if idx == 0:
@@ -148,7 +149,7 @@ def run_cuda():
 
     grid = (1, 1, 1)
     block = (2, 1, 1)
-    cosine_distance[grid, block](v1, v2)
+    cosine_distance[grid, block, None, 4 * 2](v1, v2)
 
 
 if __name__ == "__main__":
