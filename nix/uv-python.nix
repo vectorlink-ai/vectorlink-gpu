@@ -38,6 +38,7 @@ rm -f $out/lib/python3.12/site-packages/nvidia/__pycache__/__init__.cpython-312.
       "nvidia-nvtx-cu12"
       "torch"
       "taichi"
+      "numba"
     ];
     pyprojectOverrides = final: prev: {
       pybars3 = prev.pybars3.overrideAttrs (p:{

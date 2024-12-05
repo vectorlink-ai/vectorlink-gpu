@@ -22,17 +22,36 @@ def dot_product(
     return acc
 
 
+@cuda.jit
 def distance(vector, query_vector, vector_idx):
     if vector_idx == 0:
         pass
     pass
 
 
+@cuda.jit(
+    """
+void(float32[:],
+     int64,
+     int64
+    )
+""",
+    device=True,
+)
 def sum_part(vec, scale, idx):
     if idx < scale:
         vec[idx] += vec[idx + scale]
 
 
+@cuda.jit(
+    """
+float32(float32[:],
+        int64,
+        int64
+    )
+""",
+    device=True,
+)
 def sum(vec, dim, idx):
     while dim > 32:
         dim /= 2
@@ -47,20 +66,15 @@ def sum(vec, dim, idx):
 
 @cuda.jit(
     """
-void(float32[:],
-     float32[:],
-     float32[:]
+float32(float32[:],
+        float32[:],
+        float32[:],
+        int64,
+        int64
     )
-"""
+""",
+    device=True,
 )
-def cosine_distance_kernel(vec1, vec2, out):
-    scratch_buffer = numba.cuda.shared.array(2, cuda.float32)
-    dimension = vec1.size[0]
-    vector_idx = cuda.blockDim.x * cuda.blockIdx.x + cuda.threadIdx.x
-    if vector_idx < dimension:
-        out[0] = cosine_distance(vec1, vec2, scratch_buffer, dimension, vector_idx)
-
-
 def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
     buf[idx] = vec1[idx] * vec2[idx]
     numba.cuda.syncthreads()
@@ -76,20 +90,36 @@ def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
     return result
 
 
+@cuda.jit(
+    """
+void(float32[:],
+     float32[:],
+     float32[:]
+    )
+"""
+)
+def cosine_distance_kernel(vec1, vec2, out):
+    scratch_buffer = numba.cuda.shared.array(2, numba.float32)
+    dimension = vec1.shape[0]
+    vector_idx = cuda.blockDim.x * cuda.blockIdx.x + cuda.threadIdx.x
+    if vector_idx < dimension:
+        out[0] = cosine_distance(vec1, vec2, scratch_buffer, dimension, vector_idx)
+
+
 INT32_MAX = 99
 F32_MAX = 99.9
 
 
-@cuda.jit(
-    """
-void(float32[:, :],
-     int32[:, :],
-     int32[:, :],
-     float32[:, :],
-     int32[:, :],
-     float32[:, :])
-"""
-)
+# @cuda.jit(
+#    """
+# void(float32[:, :],
+#     int32[:, :],
+#     int32[:, :],
+#     float32[:, :],
+#     int32[:, :],
+#     float32[:, :])
+# """
+# )
 def distance_from_seeds(
     query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
 ):
@@ -104,7 +134,7 @@ def distance_from_seeds(
     queue_size = neighbors_to_visit.shape[1]
 
     queue_idx = neighbor_queue_idx % neighborhood_size
-    neighborhood_idx = neighbor_queue_idx / neighborhood_size
+    neighborhood_idx = int(neighbor_queue_idx / neighborhood_size)
 
     if vector_idx >= vector_dim or queue_idx >= queue_size or batch_idx >= batch_size:
         return
@@ -149,7 +179,7 @@ def run_cuda():
 
     grid = (1, 1, 1)
     block = (2, 1, 1)
-    cosine_distance[grid, block, None, 4 * 2](v1, v2)
+    cosine_distance_kernel[grid, block, None, 4 * 2](v1, v2)
 
 
 if __name__ == "__main__":
