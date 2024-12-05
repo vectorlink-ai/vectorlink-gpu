@@ -26,5 +26,9 @@ def do_dot_product():
 
 
 def main():
-    taichi.init(arch=taichi.vulkan)
+    taichi.init(arch=taichi.cuda)
     print(do_dot_product())
+
+
+if __name__ == "__main__":
+    main()

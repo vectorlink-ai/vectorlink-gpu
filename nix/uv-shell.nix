@@ -20,7 +20,7 @@ mkShell {
     # Undo dependency propagation by nixpkgs.
     unset PYTHONPATH
     # Get repository root using git. This is expanded at runtime by the editable `.pth` machinery.
-    #export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${lib.makeLibraryPath [stdenv.cc.cc]}"
+    # export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${lib.makeLibraryPath [linuxPackages.nvidia_x11]}"
     export REPO_ROOT=$(git rev-parse --show-toplevel)
     export TRITON_LIBCUDA_PATH=${cudaPackages.cuda_cudart}/lib
     export LIBRARY_PATH="${lib.makeLibraryPath [cudaPackages.cuda_cudart]}/stubs"
