@@ -472,6 +472,15 @@ wheels = [
 ]
 
 [[package]]
+name = "dill"
+version = "0.3.9"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/70/43/86fe3f9e130c4137b0f1b50784dd70a5087b911fe07fa81e53e0c4c47fea/dill-0.3.9.tar.gz", hash = "sha256:81aa267dddf68cbfe8029c42ca9ec6a4ab3b22371d1c450abc54422577b4512c", size = 187000 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/46/d1/e73b6ad76f0b1fb7f23c35c6d95dbc506a9c8804f43dda8cb5b0fa6331fd/dill-0.3.9-py3-none-any.whl", hash = "sha256:468dff3b89520b474c0397703366b7b95eebe6303f108adf9b19da1f702be87a", size = 119418 },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2224,6 +2233,23 @@ wheels = [
 ]
 
 [[package]]
+name = "taichi"
+version = "1.7.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama" },
+    { name = "dill" },
+    { name = "numpy" },
+    { name = "rich" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d4/0d/c2763d139bc3915c438f8b54587689b4a65dfc4ffd143fe42411f50326ba/taichi-1.7.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:5e02427f2f5109ce52e3a2c2a3a41e745a4a3e415a125386b12f2e7f9e45c9ff", size = 50323207 },
+    { url = "https://files.pythonhosted.org/packages/20/61/33f3e6d62b45d88104574db98cb1da29f0c092265ed83478e5399832514b/taichi-1.7.2-cp312-cp312-macosx_11_0_x86_64.whl", hash = "sha256:dca5b3ac63cc0369034d75c7fd1fee93288bd964fa2464778f1cc40540ab928a", size = 57084422 },
+    { url = "https://files.pythonhosted.org/packages/a4/c1/0a4af7f8f5231e0fe31b4fabf6da32fbf73e77ae540460371f00837b934e/taichi-1.7.2-cp312-cp312-manylinux_2_27_x86_64.whl", hash = "sha256:6faa8d505b207807dc4e42e137dd6af76b0bfdedbd2aefa5ad59a231f355f104", size = 54983936 },
+    { url = "https://files.pythonhosted.org/packages/13/e4/328a380bceedf3dda18201ff5e6b18a051784328ace22549a8418cce4d08/taichi-1.7.2-cp312-cp312-win_amd64.whl", hash = "sha256:a30e7dc72db12419eca23690d649ef0aa6644d7ed54988de9dfbcb6ae7b303a5", size = 83180117 },
+]
+
+[[package]]
 name = "tenacity"
 version = "9.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2357,6 +2383,7 @@ dependencies = [
     { name = "pandas" },
     { name = "pyarrow" },
     { name = "pybars3" },
+    { name = "taichi" },
     { name = "tensorboard" },
     { name = "torch" },
     { name = "torch-kmeans" },
@@ -2378,6 +2405,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.2.3" },
     { name = "pyarrow", specifier = ">=18.0.0" },
     { name = "pybars3", specifier = ">=0.9.7" },
+    { name = "taichi", specifier = ">=1.7.2" },
     { name = "tensorboard", specifier = ">=2.18.0" },
     { name = "torch", specifier = "==2.5.0" },
     { name = "torch-kmeans", specifier = ">=0.2.0" },

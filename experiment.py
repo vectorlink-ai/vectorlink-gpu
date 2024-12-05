@@ -6,6 +6,8 @@ import sys
 from datetime import datetime
 import time
 import sys
+import taichi
+from taichi import types as ty
 
 MAXINT = 99
 MAXFLOAT = 99.0
@@ -41,6 +43,7 @@ class Queue:
         self.length = queue_length
         self.indices = torch.full((num_queues, capacity), MAXINT)
         self.distances = torch.full((num_queues, capacity), MAXFLOAT)
+        self.buffers = torch.empty((num_queues, self.length))
 
     def initialize_from_queue(self, queue):
         head_length = min(queue.length, self.length)
@@ -55,20 +58,20 @@ class Queue:
         distances_batch: Tensor,
         exclude: Optional[Tensor] = None,  # formatted like [[0],[1],[2]]
     ):
-        bufs = torch.narrow_copy(self.indices, 1, 0, self.length)
+        self.buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
         (batches, size_per_batch) = vector_id_batch.size()
         indices_tail = self.indices.narrow(1, self.length, size_per_batch)
         distances_tail = self.distances.narrow(1, self.length, size_per_batch)
         indices_tail.copy_(vector_id_batch)
         distances_tail.copy_(distances_batch)
 
-        if not exclude is None:
+        if exclude is not None:
             exclude_mask = indices_tail == exclude.expand(batches, size_per_batch)
             indices_tail[exclude_mask] = MAXINT
             distances_tail[exclude_mask] = MAXFLOAT
 
         (self.indices, self.distances) = queue_sort(self.indices, self.distances)
-        did_something_mask = self.indices.narrow(1, 0, self.length) != bufs
+        did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
         return did_something_mask
 
     def print(self, tail: Optional[bool] = False):
@@ -103,6 +106,35 @@ def comparison(qvs, nvs):
         return results.reshape(batch_size, queue_size)
 
 
+@taichi.func
+def distance(
+    x: ty.ndarray(dtype=taichi.f32, ndim=1), y: ty.ndarray(dtype=taichi.f32, ndim=1)
+) -> taichi.f32:
+    return (1 - taichi.math.dot(x, y)) / 2
+
+
+@taichi.kernel
+def search_from_seeds_kernel(
+    query_vecs: ty.ndarray(ndim=2),
+    neighbors_to_visit: ty.ndarray(ndim=2),
+    neighborhoods: ty.ndarray(ndim=2),
+    vectors: ty.ndarray(ndim=2),
+    out: ty.ndarray(ndim=2),
+):
+    vector_dimension = vectors.shape[1]
+    neighborhood_size = neighborhoods.shape[1]
+    (batch_size, queue_length) = neighbors_to_visit.shape
+    for batch_idx, queue_idx, neighbor_idx, vector_idx in taichi.ndrange(
+        batch_size, queue_length, neighborhood_size, vector_dimension
+    ):
+        neighborhood_id = neighbors_to_visit[batch_idx, queue_idx]
+        vec = vectors[neighborhoods[neighborhood_id, neighbor_idx]]
+        query_vec = query_vecs[batch_idx]
+        acc = 0.0
+        for i in range(0, vector_dimension):
+            out[batch_idx, queue_idx] = distance(vec, query_vec)
+
+
 def search_from_seeds(
     query_vecs: Tensor,
     neighbors_to_visit: Tensor,
@@ -128,13 +160,13 @@ def search_from_seeds(
         indexes_of_comparisons = index_list.view(
             batch_size, visit_length * neighborhood_size
         )
-        # print_timestamp("vectors")
+        print_timestamp("vectors")
         # preallocated
 
         vectors_for_comparison = torch.index_select(
             vectors, 0, index_list  # , out=preallocated_vector_batch
         ).view(batch_size, visit_length * neighborhood_size, vector_dimension)
-        # print_timestamp("did index select")
+        print_timestamp("did index select")
         # return (query_vecs, vectors_for_comparison)
         # print_timestamp(" before compare")
         distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
@@ -173,10 +205,10 @@ def closest_vectors(
         visit_queue.initialize_from_queue(search_queue)
         did_something = torch.full([batch_size], True)
         seen = exclude if exclude is not None else torch.empty(batch_size, 0)
-        # preallocated_vector_batch = torch.empty(
-        #    (batch_size * PARALLEL_VISIT_COUNT * neighborhood_size, vector_dimension),
-        #    dtype=torch.float32,
-        # )
+        preallocated_vector_batch = torch.empty(
+            (batch_size * PARALLEL_VISIT_COUNT * neighborhood_size, vector_dimension),
+            dtype=torch.float32,
+        )
         while torch.any(did_something):
             # print_timestamp("start of loop")
             # visit_queue.print()
@@ -189,8 +221,8 @@ def closest_vectors(
                 neighbors_to_visit,
                 neighborhoods,
                 vectors,
-                None,
-                # preallocated_vector_batch.narrow(0, 0, narrow_to),
+                # None,
+                preallocated_vector_batch.narrow(0, 0, narrow_to),
             )
             # print_timestamp("searched")
             # Search queue
@@ -469,7 +501,7 @@ def generate_hnsw():
 
 
 NEIGHBORHOOD_QUEUE_FACTOR = 3
-CAGRA_LOOPS = 1
+CAGRA_LOOPS = 3
 
 
 def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
