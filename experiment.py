@@ -9,7 +9,7 @@ import sys
 
 MAXINT = 99
 MAXFLOAT = 99.0
-DEVICE = "cpu"
+DEVICE = "cuda"
 
 
 def timed(fn):
@@ -455,7 +455,7 @@ def primes(size: int):
 
 
 def generate_circulant_neighborhoods(num_vecs: Tensor, primes: Tensor):
-    indices = torch.arange(num_vecs)
+    indices = torch.arange(num_vecs, device=DEVICE)
     (nhs,) = primes.size()
     repeated_indices = indices.expand(nhs, num_vecs).transpose(0, 1)
     repeated_primes = primes.expand(num_vecs, nhs)
@@ -581,28 +581,27 @@ def print_timestamp(msg):
 
 
 if __name__ == "__main__":
+    torch.set_default_device(DEVICE)
+    torch.set_float32_matmul_precision("high")
 
-    recall_test(2000)
+    recall_test(10000)
 
     sys.exit(0)
-    with torch.no_grad():
-        torch.set_default_device(DEVICE)
-        torch.set_float32_matmul_precision("high")
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CUDA,
-                torch.profiler.ProfilerActivity.CPU,
-            ],
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "./log", use_gzip=True
-            ),
+    with torch.profiler.profile(
+         activities=[
+             torch.profiler.ProfilerActivity.CUDA,
+             torch.profiler.ProfilerActivity.CPU,
+         ],
+         record_shapes=True,
+         profile_memory=True,
+         with_stack=True,
+         on_trace_ready=torch.profiler.tensorboard_trace_handler(
+         "./log", use_gzip=True
+         ),
         ) as prof:
-            prof.step()
-            # with torch.profiler.record_function("recall_test"):
-            recall_test(2000)
+        prof.step()
+        # with torch.profiler.record_function("recall_test"):
+        recall_test(2000)
 
         # print(prof.key_averages().table())
         # print(prof.key_averages().table(sort_by="self_cuda_time_total"))
