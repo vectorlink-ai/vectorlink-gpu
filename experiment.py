@@ -14,6 +14,41 @@ MAXFLOAT = 99.0
 DEVICE = "cpu"
 
 
+class FakeStream:
+    def __init__(self):
+        pass
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exception_type, exception_value, traceback):
+        pass
+
+
+def allocate_stream():
+    if torch.cuda.is_available():
+        return torch.cuda.Stream()
+    else:
+        return FakeStream()
+
+
+def current_stream(s):
+    if torch.cuda.is_available():
+        return torch.cuda.stream(s)
+    else:
+        return FakeStream()
+
+
+def wait_stream(s1, s2):
+    if torch.cuda.is_available():
+        s1.stream_wait(s2)
+
+
+def record_stream(A, s):
+    if torch.cuda.is_available():
+        A.record_stream(s)
+
+
 def timed(fn):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -209,6 +244,40 @@ def closest_vectors(
             (batch_size * PARALLEL_VISIT_COUNT * neighborhood_size, vector_dimension),
             dtype=torch.float32,
         )
+        """
+        Stream Diagram
+
+        s1                       s2               s3              s4
+        search_from_seeds--wait->|                |                |
+        |                        |                |                |
+        search_queue_inesrt   rowwise -- wait --->|                |
+        |                        |                |                |
+        |               indexes of comp    distances of comp       |
+        |                        |----------------o----------wait->|
+        |                        |                |                |
+        |                        |<-wait----------|                |
+        |                 visit queue insert      |             add_new_to_seen
+        |                        |                |                |
+        |<-wait------------------o----------------o-----------------
+        |<-wait------------------|   U
+
+        Stream DAG
+                                s1
+                                 |
+                           search_from_seeds
+                        s1/       \\s2
+        search_queue_insert        rowwise______________
+                     s1|             |s2                \\ s3
+                       |    indexes of comparison_  ____distances of comparison
+                       |             |           \\/                      |
+                       |             |s2        s3/\\s4                   |s3
+                       |       visit_queue_insert   add_new_to_seen       |
+                      \\             |s2             |s4                 /
+                        ------------------------------------------------
+                                               |
+                                          back to search from seeds
+        """
+
         while torch.any(did_something):
             # print_timestamp("start of loop")
             # visit_queue.print()
@@ -216,34 +285,51 @@ def closest_vectors(
             (_, visit_length) = neighbors_to_visit.size()
             narrow_to = batch_size * visit_length * neighborhood_size
             # print_timestamp("popped")
-            (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
-                query_vecs,
-                neighbors_to_visit,
-                neighborhoods,
-                vectors,
-                # None,
-                preallocated_vector_batch.narrow(0, 0, narrow_to),
-            )
-            # print_timestamp("searched")
+            s1 = allocate_stream()
+            s2 = allocate_stream()
+            s3 = allocate_stream()
+            s4 = allocate_stream()
+
+            with current_stream(s1):
+                (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
+                    query_vecs,
+                    neighbors_to_visit,
+                    neighborhoods,
+                    vectors,
+                    # None,
+                    preallocated_vector_batch.narrow(0, 0, narrow_to),
+                )
+
+            wait_stream(s2, s1)
             # Search queue
-            did_something = search_queue.insert(
-                indexes_of_comparisons, distances_of_comparisons, exclude=exclude
-            )
-            # print_timestamp("inserted in search queue")
-            # Visit queue setup
-            mask = rowwise_isin(indexes_of_comparisons, seen)
-            # print_timestamp("calculated mask")
-            # mask = torch.isin(indexes_of_comparisons, seen)
-            indexes_of_comparisons[mask] = MAXINT
-            distances_of_comparisons[mask] = MAXFLOAT
+            with current_stream(s1):
+                did_something = search_queue.insert(
+                    indexes_of_comparisons, distances_of_comparisons, exclude=exclude
+                )
 
-            visit_queue.insert(indexes_of_comparisons, distances_of_comparisons)
-            # print_timestamp("inserted in visit queue")
+            with current_stream(s2):
+                mask = rowwise_isin(indexes_of_comparisons, seen)
 
-            seen = add_new_to_seen(seen, indexes_of_comparisons)
-            # print_timestamp("updated seen")
-            # print_timestamp("end of loop")
-        # print_timestamp("end of closest vectors")
+            wait_stream(s3, s2)
+            with current_stream(s2):
+                indexes_of_comparisons[mask] = MAXINT
+                record_stream(indexes_of_comparisons, s2)
+            wait_stream(s4, s2)
+            with current_stream(s3):
+                distances_of_comparisons[mask] = MAXFLOAT
+                record_stream(indexes_of_comparisons, s3)
+
+            wait_stream(s2, s3)
+            with current_stream(s2):
+                visit_queue.insert(indexes_of_comparisons, distances_of_comparisons)
+
+            with current_stream(s4):
+                seen = add_new_to_seen(seen, indexes_of_comparisons)
+                record_stream(seen, s4)
+
+            wait_stream(s1, s2)
+            wait_stream(s1, s3)
+            wait_stream(s1, s4)
 
 
 def search_layers(
