@@ -145,10 +145,10 @@ def sum_part(vec, scale, idx):
 
 
 @cuda.jit(float32(float32[::1], int64, int64), device=True)
-def sum(vec, dim, idx_group):
+def sum(vec, dim, idx):
     while dim > 32:
         dim /= 2
-        sum_part(vec, dim, idx_group)
+        sum_part(vec, dim, idx)
     numba.cuda.syncthreads()
     result = 0.0
     if idx == 0:
@@ -168,9 +168,18 @@ def sum_kernel(vec, out):
 
 
 @cuda.jit(float32(float32[::1], float32[::1], float32[::1], int64, int64), device=True)
-def cosine_distance(vec1, vec2, buf, vector_dimension, idx_group):
-    buf[idx] = vec1[idx] * vec2[idx]
+def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
+    groups = int((vector_dimension + 1023) / 1024)
+    for group_index in range(0, groups):
+        inner_idx = idx + group_index * 1024
+        if inner_idx >= vector_dimension:
+            break
+
+        buf[inner_idx] = vec1[inner_idx] * vec2[inner_idx]
+        groups -= 1
+
     numba.cuda.syncthreads()
+    # TODO sum will only work for vectors up to dim 2048 the way things are written now
     cos_theta = sum(buf, vector_dimension, idx)
     numba.cuda.syncthreads()
     result = 1234.0
@@ -240,7 +249,8 @@ def cuda_search_from_seeds(
     (batch_size, visit_length) = neighbors_to_visit.size()
     (_, neighborhood_size) = neighborhoods.size()
     (_, vector_dimension) = vectors.size()
-    vector_idx_group_size = int(vector_dimension / 2)
+    # TODO 1024 should probably be queried instead
+    vector_idx_group_size = max(int(vector_dimension / 2), 1024)
     float_size = 4
 
     grid = (batch_size, visit_length, neighborhood_size)
