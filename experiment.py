@@ -13,8 +13,8 @@ from numba import cuda, gdb_init, void, float32, int64, int32
 # INT32_MAX = int32(2147483647)
 # FLOAT32_MAX = float32(3.4028235e38)
 
-MAXINT = 99
-MAXFLOAT = 99.0
+MAXINT = 999999
+MAXFLOAT = 999999.0
 MAXINT_CUDA = int32(MAXINT)
 MAXFLOAT_CUDA = float32(MAXFLOAT)
 DEVICE = "cuda"
@@ -138,21 +138,22 @@ class Queue:
         return self.indices.size()
 
 
-@cuda.jit(void(float32[::1], int64, int64), device=True)
-def sum_part(vec, scale, idx):
-    if idx < scale:
+@cuda.jit(void(float32[::1], int64, int64, int64), device=True)
+def sum_part(vec, dim, scale, idx):
+    if idx + scale < dim and idx < scale:
         vec[idx] += vec[idx + scale]
 
 
 @cuda.jit(float32(float32[::1], int64, int64), device=True)
 def sum(vec, dim, idx):
-    while dim > 32:
-        dim /= 2
-        sum_part(vec, dim, idx)
+    scale = dim
+    while scale > 32:
+        scale /= 2
+        sum_part(vec, dim, scale, idx)
     numba.cuda.syncthreads()
     result = 0.0
     if idx == 0:
-        for i in range(0, dim):
+        for i in range(0, scale):
             result += vec[i]
     return result
 
@@ -176,7 +177,6 @@ def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
             break
 
         buf[inner_idx] = vec1[inner_idx] * vec2[inner_idx]
-        groups -= 1
 
     numba.cuda.syncthreads()
     # TODO sum will only work for vectors up to dim 2048 the way things are written now
@@ -190,6 +190,19 @@ def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
         elif result > 1.0:
             result = 1.0
     return result
+
+
+@cuda.jit(void(float32[::1], float32[::1], float32[::1]))
+def cosine_distance_kernel(vec1, vec2, out):
+    scratch_buffer = numba.cuda.shared.array(1536 * 4, numba.float32)
+    dimension = vec1.shape[0]
+    vector_idx_group = cuda.blockDim.x * cuda.blockIdx.x + cuda.threadIdx.x
+    if vector_idx_group < dimension:
+        result = cosine_distance(
+            vec1, vec2, scratch_buffer, dimension, vector_idx_group
+        )
+        if vector_idx_group == 0:
+            out[0] = result
 
 
 @cuda.jit(
@@ -222,13 +235,17 @@ def cuda_search_from_seeds_kernel(
     if vector_idx >= vector_dim or queue_idx >= queue_size or batch_idx >= batch_size:
         return
 
+    assert batch_idx < batch_size
+    assert queue_idx < queue_size
     node_id = neighbors_to_visit[batch_idx, queue_idx]
     if node_id > vector_count:
         if vector_idx == 0:
-            index_out[batch_idx, queue_idx] = MAXINT
-            distance_out[batch_idx, queue_idx] = MAXFLOAT
+            output_idx = queue_idx * neighborhood_size + neighborhood_idx
+            index_out[batch_idx, output_idx] = MAXINT
+            distance_out[batch_idx, output_idx] = MAXFLOAT
     else:
         neighbor_vector_id = neighborhoods[node_id, neighborhood_idx]
+        assert neighbor_vector_id < vector_count
         vector = vectors[neighbor_vector_id]
         query_vector = query_vecs[batch_idx]
         result = cosine_distance(
@@ -240,36 +257,67 @@ def cuda_search_from_seeds_kernel(
             distance_out[batch_idx, output_idx] = result
 
 
+COUNT = 0
+
+
 def cuda_search_from_seeds(
     query_vecs: Tensor,
     neighbors_to_visit: Tensor,
     neighborhoods: Tensor,
     vectors: Tensor,
 ) -> (Tensor, Tensor):
+    global COUNT
+
+    assert query_vecs.is_contiguous()
+    assert neighbors_to_visit.is_contiguous()
+    assert neighborhoods.is_contiguous()
+    assert vectors.is_contiguous()
     (batch_size, visit_length) = neighbors_to_visit.size()
     (_, neighborhood_size) = neighborhoods.size()
     (_, vector_dimension) = vectors.size()
     # TODO 1024 should probably be queried instead
-    vector_idx_group_size = max(int(vector_dimension / 2), 1024)
+    vector_idx_group_size = min(vector_dimension, 1024)
     float_size = 4
+    # print(f"COUNT {COUNT}")
+
+    # print("index in")
+    # print(neighbors_to_visit)
 
     grid = (batch_size, visit_length, neighborhood_size)
     block = (vector_idx_group_size, 1, 1)
 
-    index_out = torch.tensor(
+    index_out = torch.empty(
         (batch_size, visit_length * neighborhood_size), dtype=torch.int32, device=DEVICE
     )
-    distance_out = torch.tensor(
+
+    # index_out = torch.full(
+    #     (batch_size, visit_length * neighborhood_size),
+    #     MAXINT,
+    #     dtype=torch.int32,
+    #     device=DEVICE,
+    # )
+
+    distance_out = torch.empty(
         (batch_size, visit_length * neighborhood_size),
         dtype=torch.float32,
         device=DEVICE,
     )
-    print(grid)
-    print(block)
+    # distance_out = torch.full(
+    #     (batch_size, visit_length * neighborhood_size),
+    #     MAXFLOAT,
+    #     dtype=torch.float32,
+    #     device=DEVICE,
+    # )
 
     cuda_search_from_seeds_kernel[grid, block, None, vector_dimension * float_size](
         query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
     )
+    # print("index out")
+    # print(index_out)
+    # COUNT += 1
+    # if COUNT > 10:
+    #     COUNT = 0
+    #     return
     return (index_out, distance_out)
 
 
@@ -363,8 +411,13 @@ def closest_vectors(
         capacity = VISIT_QUEUE_LEN + extra_capacity
         visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
         visit_queue.initialize_from_queue(search_queue)
+
         did_something = torch.full([batch_size], True)
-        seen = exclude if exclude is not None else torch.empty(batch_size, 0)
+        seen = (
+            exclude
+            if exclude is not None
+            else torch.empty((batch_size, 0), dtype=torch.int32)
+        )
         """
         Stream Diagram
 
@@ -418,7 +471,6 @@ def closest_vectors(
                     neighborhoods,
                     vectors,
                 )
-
             wait_stream(s2, s1)
             # Search queue
             with current_stream(s1):
@@ -433,6 +485,7 @@ def closest_vectors(
             with current_stream(s2):
                 indexes_of_comparisons[mask] = MAXINT
                 record_stream(indexes_of_comparisons, s2)
+
             wait_stream(s4, s2)
             with current_stream(s3):
                 distances_of_comparisons[mask] = MAXFLOAT
@@ -441,11 +494,15 @@ def closest_vectors(
             wait_stream(s2, s3)
             with current_stream(s2):
                 visit_queue.insert(indexes_of_comparisons, distances_of_comparisons)
+            # print("seen 0")
+            # print(seen)
 
             with current_stream(s4):
                 seen = add_new_to_seen(seen, indexes_of_comparisons)
                 record_stream(seen, s4)
 
+            # print("seen 1")
+            # print(seen)
             wait_stream(s1, s2)
             wait_stream(s1, s3)
             wait_stream(s1, s4)
@@ -474,8 +531,12 @@ def shrink_to_fit(seen):
     with profiler.record_function("shrink_to_fit"):
         (values, _) = seen.sort()
         (dim1, dim2) = seen.size()
-        shifted = torch.hstack([values[:, 1:], torch.full([dim1, 1], MAXINT)])
+        shifted = torch.hstack(
+            [values[:, 1:], torch.full([dim1, 1], MAXINT, dtype=torch.int32)]
+        )
         mask = values == shifted
+        print("values")
+        print(values)
         values[mask] = MAXINT
         (values, _) = values.sort()
         max_val_mask = values == MAXINT
@@ -693,7 +754,7 @@ def primes(size: int):
     return PRIMES.narrow(0, 0, size)
 
 
-def generate_circulant_neighborhoods(num_vecs: Tensor, primes: Tensor):
+def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
     indices = torch.arange(num_vecs, device=DEVICE)
     (nhs,) = primes.size()
     repeated_indices = indices.expand(nhs, num_vecs).transpose(0, 1)
@@ -727,8 +788,6 @@ def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
         queue_length,
         queue_length + remaining_capacity,
     )  # make que from neighborhoods + neigbhorhood_distances
-    # print_timestamp("queue allocated")
-    # queue.print()
     # print("neigbhorhoods")
     # print(neighborhoods)
     # print("neighborhood distances")
@@ -737,13 +796,17 @@ def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
     # print_timestamp("initial queue constructed from neighborhoods")
     exclude = torch.arange(num_vecs).unsqueeze(1)
     for i in range(0, CAGRA_LOOPS):
-        # print_timestamp(f"start of cagra loop {i}")
+        print_timestamp(f"start of cagra loop {i}")
         closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
         # print_timestamp(f" closest vectors calculated")
-        # print(f"cagra loop {i}")
-        # queue.print()
+        print(f"queue at cagra loop {i}")
+        queue.print()
         neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
-        # print_timestamp(f"end of cagra loop {i}")
+        print("neighborhoods")
+        print(neighborhoods)
+        print("neighborhood is cont")
+        print(neighborhoods.is_contiguous())
+        print_timestamp(f"end of cagra loop {i}")
     return neighborhoods.narrow(1, 0, neighborhood_size)
 
 
@@ -790,14 +853,16 @@ def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
 
 
 def recall_test(
-    number_of_vectors: int, dimensions: int = 1535, neighborhood_size: int = 24
+    number_of_vectors: int, dimensions: int = 2, neighborhood_size: int = 24
 ):
     # print_timestamp("recall test starts")
     vectors = torch.nn.functional.normalize(
-        torch.randn(number_of_vectors, dimensions), dim=1
+        torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
     )
     # print_timestamp("vectors allocated")
-    neighborhoods = generate_ann(primes(24), vectors)
+    neighborhoods = generate_ann(primes(neighborhood_size), vectors)
+    print(neighborhoods)
+    return
     # print_timestamp("ann generated")
     queue = initial_queue(vectors, neighborhood_size, 3 * neighborhood_size)
     # print_timestamp("queues allocated")
@@ -806,6 +871,8 @@ def recall_test(
     # print_timestamp("closest vectors calculated")
     expected = torch.arange(number_of_vectors)
     actual = queue.indices.t()[0]
+    print("actual")
+    print(actual)
     found = (expected == actual).sum().item()
 
     # print_timestamp("calculated recall")
@@ -816,22 +883,41 @@ def recall_test(
 
 # Function to print timestamps
 def print_timestamp(msg):
-    pass
+    print(msg)
 
 
 if __name__ == "__main__":
     torch.set_default_device(DEVICE)
     torch.set_float32_matmul_precision("high")
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CUDA,
-            torch.profiler.ProfilerActivity.CPU,
-        ],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log", use_gzip=True),
-    ) as prof:
-        prof.step()
-        # with torch.profiler.record_function("recall_test"):
-        recall_test(2000)
+
+    # grid = (1, 1, 1)
+    # block = (1024, 1, 1)
+    # vec_in = torch.arange(1536, dtype=torch.float32, device="cuda")
+    # out = torch.tensor([0.0], dtype=torch.float32, device="cuda")
+    # sum_kernel[grid, block](vec_in, out)
+    # print(out)
+    # sys.exit(0)
+
+    # v1 = torch.nn.functional.normalize(torch.full((1536,), 1.0), dim=0)
+    # v2 = torch.nn.functional.normalize(torch.full((1536,), 1.0), dim=0)
+    # grid = (1, 1, 1)
+    # block = (1024, 1, 1)
+    # result = torch.tensor([4.0], dtype=torch.float32, device="cuda")
+    # cosine_distance_kernel[grid, block](v1, v2, numba.cuda.as_cuda_array(result))
+    # print("cosine kernel result")
+    # print(result)
+    # sys.exit(0)
+
+    # with torch.profiler.profile(
+    #     activities=[
+    #         torch.profiler.ProfilerActivity.CUDA,
+    #         torch.profiler.ProfilerActivity.CPU,
+    #     ],
+    #     record_shapes=True,
+    #     profile_memory=True,
+    #     with_stack=True,
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler("./log", use_gzip=True),
+    # ) as prof:
+    #     prof.step()
+    #     # with torch.profiler.record_function("recall_test"):
+    recall_test(10)
