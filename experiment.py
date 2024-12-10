@@ -864,12 +864,16 @@ def generate_hnsw(neighborhood_size: int, vectors: Tensor):
     """ """
     layers = []
     (count, _) = vectors.size()
-    minimum_size = neighborhood_size * 3
-    order = count
-    while order > minimum_size:
-        layers.append(generate_ann(neighborhood_size, vectors[0:order]))
-        order = int(order / minimum_size)
-    layers.reverse()
+    order = neighborhood_size * 3
+    size = order
+    while True:
+        bound = min(size, count)
+        layers.append(generate_ann(neighborhood_size, vectors[0:bound]))
+        if size > count:
+            break
+        else:
+            size = order * size
+
     return layers
 
 
@@ -1065,7 +1069,7 @@ if __name__ == "__main__":
     # ) as prof:
     #     prof.step()
     #     # with torch.profiler.record_function("recall_test"):
-    vectors = generate_random_vectors(2000)
+    vectors = generate_random_vectors(1000)
     print("ANN >>>>>")
     ann_recall_test(vectors)
     print("HNSW >>>>>")
