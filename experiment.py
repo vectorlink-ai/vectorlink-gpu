@@ -515,9 +515,8 @@ def search_layers(
 ):
     (number_of_batches, _) = query_vecs.size()
     # we don't exclude everything, since we're starting from actual query vecs, not indices
-    exclude = torch.empty(number_of_batches, 0)
     for layer in layers:
-        closest_vectors(query_vecs, search_queue, vectors, layer, exclude)
+        closest_vectors(query_vecs, search_queue, vectors, layer, None)
 
 
 def search_from_initial():
@@ -861,9 +860,17 @@ def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
     return circulant_neighbors.sort().values % num_vecs
 
 
-def generate_hnsw():
+def generate_hnsw(neighborhood_size: int, vectors: Tensor):
     """ """
-    pass
+    layers = []
+    (count, _) = vectors.size()
+    minimum_size = neighborhood_size * 3
+    order = count
+    while order > minimum_size:
+        layers.append(generate_ann(neighborhood_size, vectors[0:order]))
+        order = int(order / minimum_size)
+    layers.reverse()
+    return layers
 
 
 NEIGHBORHOOD_QUEUE_FACTOR = 3
@@ -900,7 +907,9 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
         # print(f"queue at cagra loop {i}")
         # queue.print()
         neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
-        calculate_recall(vectors, neighborhoods.narrow_copy(1, 0, neighborhood_size))
+        ann_calculate_recall(
+            vectors, neighborhoods.narrow_copy(1, 0, neighborhood_size)
+        )
         print_timestamp(f"end of cagra loop {i}")
     return neighborhoods.narrow_copy(1, 0, neighborhood_size)
 
@@ -950,7 +959,7 @@ def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
 RECALL_SEARCH_QUEUE_LENGTH = 6
 
 
-def calculate_recall(vectors, neighborhoods):
+def ann_calculate_recall(vectors, neighborhoods):
     (number_of_vectors, neighborhood_size) = neighborhoods.size()
 
     queue = initial_queue(
@@ -962,8 +971,6 @@ def calculate_recall(vectors, neighborhoods):
     # print_timestamp("closest vectors calculated")
     expected = torch.arange(number_of_vectors)
     actual = queue.indices.t()[0]
-    print("actual")
-    print(actual)
     found = (expected == actual).sum().item()
 
     # print_timestamp("calculated recall")
@@ -972,20 +979,51 @@ def calculate_recall(vectors, neighborhoods):
     print(found / number_of_vectors)
 
 
-def recall_test(
-    number_of_vectors: int, dimensions: int = 1536, neighborhood_size: int = 24
-):
-    # print_timestamp("recall test starts")
-    vectors = torch.nn.functional.normalize(
-        torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
+def hnsw_calculate_recall(vectors, hnsw):
+    (number_of_vectors, neighborhood_size) = hnsw[-1].size()
+
+    queue = initial_queue(
+        vectors, neighborhood_size, RECALL_SEARCH_QUEUE_LENGTH * neighborhood_size
     )
+    # print_timestamp("queues allocated")
+
+    search_layers(hnsw, vectors, queue, vectors)
+    # print_timestamp("closest vectors calculated")
+    expected = torch.arange(number_of_vectors)
+    actual = queue.indices.t()[0]
+    found = (expected == actual).sum().item()
+
+    # print_timestamp("calculated recall")
+
+    print(found)
+    print(found / number_of_vectors)
+
+
+def ann_recall_test(vectors: Tensor, neighborhood_size: int = 24):
     # print_timestamp("vectors allocated")
     neighborhoods = generate_ann(neighborhood_size, vectors)
     # print(neighborhoods)
     # return
-    print_timestamp("ann generated")
+    print_timestamp("=> ANN generated")
 
-    calculate_recall(vectors, neighborhoods)
+    ann_calculate_recall(vectors, neighborhoods)
+
+
+def hnsw_recall_test(vectors: Tensor, neighborhood_size: int = 24):
+    # print_timestamp("vectors allocated")
+    hnsw = generate_hnsw(neighborhood_size, vectors)
+    # print(neighborhoods)
+    # return
+    print_timestamp("=> HNSW generated")
+
+    hnsw_calculate_recall(vectors, hnsw)
+
+
+def generate_random_vectors(number_of_vectors: int, dimensions: int = 1536) -> Tensor:
+    vectors = torch.nn.functional.normalize(
+        torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
+    )
+    return vectors
 
 
 # Function to print timestamps
@@ -1027,4 +1065,8 @@ if __name__ == "__main__":
     # ) as prof:
     #     prof.step()
     #     # with torch.profiler.record_function("recall_test"):
-    recall_test(2000)
+    vectors = generate_random_vectors(2000)
+    print("ANN >>>>>")
+    ann_recall_test(vectors)
+    print("HNSW >>>>>")
+    hnsw_recall_test(vectors)
