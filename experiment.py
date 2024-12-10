@@ -7,8 +7,16 @@ from datetime import datetime
 import time
 import sys
 
+import numba
+from numba import cuda, gdb_init, void, float32, int64, int32
+
+# INT32_MAX = int32(2147483647)
+# FLOAT32_MAX = float32(3.4028235e38)
+
 MAXINT = 99
 MAXFLOAT = 99.0
+MAXINT_CUDA = int32(MAXINT)
+MAXFLOAT_CUDA = float32(MAXFLOAT)
 DEVICE = "cuda"
 
 
@@ -24,26 +32,26 @@ class FakeStream:
 
 
 def allocate_stream():
-    if torch.cuda.is_available():
+    if False and torch.cuda.is_available():
         return torch.cuda.Stream()
     else:
         return FakeStream()
 
 
 def current_stream(s):
-    if torch.cuda.is_available():
+    if False and torch.cuda.is_available():
         return torch.cuda.stream(s)
     else:
         return FakeStream()
 
 
 def wait_stream(s1, s2):
-    if torch.cuda.is_available():
+    if False and torch.cuda.is_available():
         s1.stream_wait(s2)
 
 
 def record_stream(A, s):
-    if torch.cuda.is_available():
+    if False and torch.cuda.is_available():
         A.record_stream(s)
 
 
@@ -130,6 +138,131 @@ class Queue:
         return self.indices.size()
 
 
+@cuda.jit(void(float32[::1], int64, int64), device=True)
+def sum_part(vec, scale, idx):
+    if idx < scale:
+        vec[idx] += vec[idx + scale]
+
+
+@cuda.jit(float32(float32[::1], int64, int64), device=True)
+def sum(vec, dim, idx_group):
+    while dim > 32:
+        dim /= 2
+        sum_part(vec, dim, idx_group)
+    numba.cuda.syncthreads()
+    result = 0.0
+    if idx == 0:
+        for i in range(0, dim):
+            result += vec[i]
+    return result
+
+
+@cuda.jit(void(float32[::1], float32[::1]))
+def sum_kernel(vec, out):
+    dim = vec.shape[0]
+    vector_idx_group = cuda.blockDim.x * cuda.blockIdx.x + cuda.threadIdx.x
+    result = sum(vec, dim, vector_idx_group)
+    numba.cuda.syncthreads()
+    if vector_idx_group == 0:
+        out[0] = result
+
+
+@cuda.jit(float32(float32[::1], float32[::1], float32[::1], int64, int64), device=True)
+def cosine_distance(vec1, vec2, buf, vector_dimension, idx_group):
+    buf[idx] = vec1[idx] * vec2[idx]
+    numba.cuda.syncthreads()
+    cos_theta = sum(buf, vector_dimension, idx)
+    numba.cuda.syncthreads()
+    result = 1234.0
+    if idx == 0:
+        result = (1 - cos_theta) / 2
+        if result < 0.0:
+            result = 0.0
+        elif result > 1.0:
+            result = 1.0
+    return result
+
+
+@cuda.jit(
+    void(
+        float32[:, ::1],
+        int32[:, ::1],
+        int32[:, ::1],
+        float32[:, ::1],
+        int32[:, ::1],
+        float32[:, ::1],
+    )
+)
+def cuda_search_from_seeds_kernel(
+    query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
+):
+    distance_buffer = numba.cuda.shared.array(4 * 1536, float32)
+
+    batch_idx = cuda.blockIdx.x
+    queue_idx = cuda.blockIdx.y
+    neighborhood_idx = cuda.blockIdx.z
+
+    vector_idx = cuda.threadIdx.x
+
+    batch_size = query_vecs.shape[0]
+    vector_count = vectors.shape[0]
+    vector_dim = query_vecs.shape[1]
+    neighborhood_size = neighborhoods.shape[1]
+    queue_size = neighbors_to_visit.shape[1]
+
+    if vector_idx >= vector_dim or queue_idx >= queue_size or batch_idx >= batch_size:
+        return
+
+    node_id = neighbors_to_visit[batch_idx, queue_idx]
+    if node_id > vector_count:
+        if vector_idx == 0:
+            index_out[batch_idx, queue_idx] = MAXINT
+            distance_out[batch_idx, queue_idx] = MAXFLOAT
+    else:
+        neighbor_vector_id = neighborhoods[node_id, neighborhood_idx]
+        vector = vectors[neighbor_vector_id]
+        query_vector = query_vecs[batch_idx]
+        result = cosine_distance(
+            vector, query_vector, distance_buffer, vector_dim, vector_idx
+        )
+        if vector_idx == 0:
+            output_idx = queue_idx * neighborhood_size + neighborhood_idx
+            index_out[batch_idx, output_idx] = neighbor_vector_id
+            distance_out[batch_idx, output_idx] = result
+
+
+def cuda_search_from_seeds(
+    query_vecs: Tensor,
+    neighbors_to_visit: Tensor,
+    neighborhoods: Tensor,
+    vectors: Tensor,
+) -> (Tensor, Tensor):
+    (batch_size, visit_length) = neighbors_to_visit.size()
+    (_, neighborhood_size) = neighborhoods.size()
+    (_, vector_dimension) = vectors.size()
+    vector_idx_group_size = int(vector_dimension / 2)
+    float_size = 4
+
+    grid = (batch_size, visit_length, neighborhood_size)
+    block = (vector_idx_group_size, 1, 1)
+
+    index_out = torch.tensor(
+        (batch_size, visit_length * neighborhood_size), dtype=torch.int32, device=DEVICE
+    )
+    distance_out = torch.tensor(
+        (batch_size, visit_length * neighborhood_size),
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    print(grid)
+    print(block)
+
+    cuda_search_from_seeds_kernel[grid, block, None, vector_dimension * float_size](
+        query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
+    )
+    return (index_out, distance_out)
+
+
 def comparison(qvs, nvs):
     with profiler.record_function("comparison"):
         batch_size, queue_size, vector_dim = nvs.size()
@@ -139,52 +272,65 @@ def comparison(qvs, nvs):
         return results.reshape(batch_size, queue_size)
 
 
+def cpu_search_from_seeds(
+    query_vecs: Tensor,
+    neighbors_to_visit: Tensor,
+    neighborhoods: Tensor,
+    vectors: Tensor,
+):
+    # print_timestamp("start of search_from_seeds")
+    (batch_size, visit_length) = neighbors_to_visit.size()
+    (_, neighborhood_size) = neighborhoods.size()
+    (_, vector_dimension) = vectors.size()
+
+    # print_timestamp("making filter mask")
+    filter_mask = neighbors_to_visit == MAXINT
+    # print_timestamp("punchout")
+    neighbors_to_visit[filter_mask] = 0  # set to 0 to get a valid element
+    # print_timestamp("index select")
+    index_list = neighborhoods.index_select(0, neighbors_to_visit.flatten()).flatten()
+    # print_timestamp("index view")
+    indexes_of_comparisons = index_list.view(
+        batch_size, visit_length * neighborhood_size
+    )
+    print_timestamp("vectors")
+    # preallocated
+
+    vectors_for_comparison = torch.index_select(vectors, 0, index_list).view(
+        batch_size, visit_length * neighborhood_size, vector_dimension
+    )
+    print_timestamp("did index select")
+    # return (query_vecs, vectors_for_comparison)
+    # print_timestamp(" before compare")
+    distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
+    # print_timestamp(" after compare")
+
+    expanded_filter_mask = (
+        filter_mask.reshape(batch_size, visit_length, 1)
+        .expand(batch_size, visit_length, neighborhood_size)
+        .reshape(batch_size, visit_length * neighborhood_size)
+    )
+    indexes_of_comparisons[expanded_filter_mask] = MAXINT
+    distances_from_comparison[expanded_filter_mask] = MAXFLOAT
+    # print_timestamp("end of search_from_seeds")
+    return (indexes_of_comparisons, distances_from_comparison)
+
+
 def search_from_seeds(
     query_vecs: Tensor,
     neighbors_to_visit: Tensor,
     neighborhoods: Tensor,
     vectors: Tensor,
-    preallocated_vector_batch: Tensor,
 ):
     with profiler.record_function("search_from_seeds"):
-        # print_timestamp("start of search_from_seeds")
-        (batch_size, visit_length) = neighbors_to_visit.size()
-        (_, neighborhood_size) = neighborhoods.size()
-        (_, vector_dimension) = vectors.size()
-
-        # print_timestamp("making filter mask")
-        filter_mask = neighbors_to_visit == MAXINT
-        # print_timestamp("punchout")
-        neighbors_to_visit[filter_mask] = 0  # set to 0 to get a valid element
-        # print_timestamp("index select")
-        index_list = neighborhoods.index_select(
-            0, neighbors_to_visit.flatten()
-        ).flatten()
-        # print_timestamp("index view")
-        indexes_of_comparisons = index_list.view(
-            batch_size, visit_length * neighborhood_size
-        )
-        print_timestamp("vectors")
-        # preallocated
-
-        vectors_for_comparison = torch.index_select(
-            vectors, 0, index_list  # , out=preallocated_vector_batch
-        ).view(batch_size, visit_length * neighborhood_size, vector_dimension)
-        print_timestamp("did index select")
-        # return (query_vecs, vectors_for_comparison)
-        # print_timestamp(" before compare")
-        distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
-        # print_timestamp(" after compare")
-
-        expanded_filter_mask = (
-            filter_mask.reshape(batch_size, visit_length, 1)
-            .expand(batch_size, visit_length, neighborhood_size)
-            .reshape(batch_size, visit_length * neighborhood_size)
-        )
-        indexes_of_comparisons[expanded_filter_mask] = MAXINT
-        distances_from_comparison[expanded_filter_mask] = MAXFLOAT
-        # print_timestamp("end of search_from_seeds")
-        return (indexes_of_comparisons, distances_from_comparison)
+        if torch.cuda.is_available():
+            return cuda_search_from_seeds(
+                query_vecs, neighbors_to_visit, neighborhoods, vectors
+            )
+        else:
+            return cpu_search_from_seeds(
+                query_vecs, neighbors_to_visit, neighborhoods, vectors
+            )
 
 
 PARALLEL_VISIT_COUNT = 3
@@ -209,10 +355,6 @@ def closest_vectors(
         visit_queue.initialize_from_queue(search_queue)
         did_something = torch.full([batch_size], True)
         seen = exclude if exclude is not None else torch.empty(batch_size, 0)
-        preallocated_vector_batch = torch.empty(
-            (batch_size * PARALLEL_VISIT_COUNT * neighborhood_size, vector_dimension),
-            dtype=torch.float32,
-        )
         """
         Stream Diagram
 
@@ -265,8 +407,6 @@ def closest_vectors(
                     neighbors_to_visit,
                     neighborhoods,
                     vectors,
-                    # None,
-                    preallocated_vector_batch.narrow(0, 0, narrow_to),
                 )
 
             wait_stream(s2, s1)
@@ -544,7 +684,7 @@ def primes(size: int):
 
 
 def generate_circulant_neighborhoods(num_vecs: Tensor, primes: Tensor):
-    indices = torch.arange(num_vecs)
+    indices = torch.arange(num_vecs, device=DEVICE)
     (nhs,) = primes.size()
     repeated_indices = indices.expand(nhs, num_vecs).transpose(0, 1)
     repeated_primes = primes.expand(num_vecs, nhs)
@@ -670,27 +810,18 @@ def print_timestamp(msg):
 
 
 if __name__ == "__main__":
-    recall_test(2000)
-
-    sys.exit(0)
-    with torch.no_grad():
-        torch.set_default_device(DEVICE)
-        torch.set_float32_matmul_precision("high")
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CUDA,
-                torch.profiler.ProfilerActivity.CPU,
-            ],
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "./log", use_gzip=True
-            ),
-        ) as prof:
-            prof.step()
-            # with torch.profiler.record_function("recall_test"):
-            recall_test(2000)
-
-        # print(prof.key_averages().table())
-        # print(prof.key_averages().table(sort_by="self_cuda_time_total"))
+    torch.set_default_device(DEVICE)
+    torch.set_float32_matmul_precision("high")
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CUDA,
+            torch.profiler.ProfilerActivity.CPU,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log", use_gzip=True),
+    ) as prof:
+        prof.step()
+        # with torch.profiler.record_function("recall_test"):
+        recall_test(2000)
