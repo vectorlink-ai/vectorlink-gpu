@@ -6,12 +6,10 @@ import sys
 from datetime import datetime
 import time
 import sys
-import taichi
-from taichi import types as ty
 
 MAXINT = 99
 MAXFLOAT = 99.0
-DEVICE = "cpu"
+DEVICE = "cuda"
 
 
 class FakeStream:
@@ -139,35 +137,6 @@ def comparison(qvs, nvs):
             1 - nvs.bmm(qvs.reshape(batch_size, 1, vector_dim).transpose(1, 2))
         ) / 2
         return results.reshape(batch_size, queue_size)
-
-
-@taichi.func
-def distance(
-    x: ty.ndarray(dtype=taichi.f32, ndim=1), y: ty.ndarray(dtype=taichi.f32, ndim=1)
-) -> taichi.f32:
-    return (1 - taichi.math.dot(x, y)) / 2
-
-
-@taichi.kernel
-def search_from_seeds_kernel(
-    query_vecs: ty.ndarray(ndim=2),
-    neighbors_to_visit: ty.ndarray(ndim=2),
-    neighborhoods: ty.ndarray(ndim=2),
-    vectors: ty.ndarray(ndim=2),
-    out: ty.ndarray(ndim=2),
-):
-    vector_dimension = vectors.shape[1]
-    neighborhood_size = neighborhoods.shape[1]
-    (batch_size, queue_length) = neighbors_to_visit.shape
-    for batch_idx, queue_idx, neighbor_idx, vector_idx in taichi.ndrange(
-        batch_size, queue_length, neighborhood_size, vector_dimension
-    ):
-        neighborhood_id = neighbors_to_visit[batch_idx, queue_idx]
-        vec = vectors[neighborhoods[neighborhood_id, neighbor_idx]]
-        query_vec = query_vecs[batch_idx]
-        acc = 0.0
-        for i in range(0, vector_dimension):
-            out[batch_idx, queue_idx] = distance(vec, query_vec)
 
 
 def search_from_seeds(
@@ -459,6 +428,7 @@ def example_db():
     neighborhoods = torch.tensor(
         [[4, 6], [4, 5], [6, 7], [5, 7], [0, 1], [1, 3], [0, 2], [2, 3]],
         dtype=torch.int32,
+        device="cuda",
     )
 
     return (vs, neighborhoods)
@@ -700,7 +670,6 @@ def print_timestamp(msg):
 
 
 if __name__ == "__main__":
-
     recall_test(2000)
 
     sys.exit(0)
