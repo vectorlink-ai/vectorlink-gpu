@@ -238,12 +238,12 @@ def cuda_search_from_seeds_kernel(
     assert batch_idx < batch_size
     assert queue_idx < queue_size
     node_id = neighbors_to_visit[batch_idx, queue_idx]
-    if node_id > vector_count:
+    if node_id == MAXINT:
         if vector_idx == 0:
             output_idx = queue_idx * neighborhood_size + neighborhood_idx
             index_out[batch_idx, output_idx] = MAXINT
             distance_out[batch_idx, output_idx] = MAXFLOAT
-    else:
+    elif node_id < vector_count:
         neighbor_vector_id = neighborhoods[node_id, neighborhood_idx]
         assert neighbor_vector_id < vector_count
         vector = vectors[neighbor_vector_id]
@@ -255,6 +255,8 @@ def cuda_search_from_seeds_kernel(
             output_idx = queue_idx * neighborhood_size + neighborhood_idx
             index_out[batch_idx, output_idx] = neighbor_vector_id
             distance_out[batch_idx, output_idx] = result
+    else:
+        assert False
 
 
 COUNT = 0
@@ -286,28 +288,28 @@ def cuda_search_from_seeds(
     grid = (batch_size, visit_length, neighborhood_size)
     block = (vector_idx_group_size, 1, 1)
 
-    index_out = torch.empty(
-        (batch_size, visit_length * neighborhood_size), dtype=torch.int32, device=DEVICE
-    )
-
-    # index_out = torch.full(
-    #     (batch_size, visit_length * neighborhood_size),
-    #     MAXINT,
-    #     dtype=torch.int32,
-    #     device=DEVICE,
+    # index_out = torch.empty(
+    #     (batch_size, visit_length * neighborhood_size), dtype=torch.int32, device=DEVICE
     # )
 
-    distance_out = torch.empty(
+    index_out = torch.full(
         (batch_size, visit_length * neighborhood_size),
-        dtype=torch.float32,
+        MAXINT,
+        dtype=torch.int32,
         device=DEVICE,
     )
-    # distance_out = torch.full(
+
+    # distance_out = torch.empty(
     #     (batch_size, visit_length * neighborhood_size),
-    #     MAXFLOAT,
     #     dtype=torch.float32,
     #     device=DEVICE,
     # )
+    distance_out = torch.full(
+        (batch_size, visit_length * neighborhood_size),
+        MAXFLOAT,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
 
     cuda_search_from_seeds_kernel[grid, block, None, vector_dimension * float_size](
         query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
@@ -535,8 +537,6 @@ def shrink_to_fit(seen):
             [values[:, 1:], torch.full([dim1, 1], MAXINT, dtype=torch.int32)]
         )
         mask = values == shifted
-        print("values")
-        print(values)
         values[mask] = MAXINT
         (values, _) = values.sort()
         max_val_mask = values == MAXINT
@@ -772,15 +772,15 @@ NEIGHBORHOOD_QUEUE_FACTOR = 3
 CAGRA_LOOPS = 3
 
 
-def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
+def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
     # print_timestamp("generating ann")
     (num_vecs, vec_dim) = vectors.size()
-    neighborhoods = generate_circulant_neighborhoods(num_vecs, primes)
+    queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
+    neighbor_primes = primes(queue_length)
+    neighborhoods = generate_circulant_neighborhoods(num_vecs, neighbor_primes)
     # print_timestamp("circulant neighborhoods generated")
-    (_, neighborhood_size) = neighborhoods.size()
     neighborhood_distances = distances(vectors, neighborhoods)
     # print_timestamp("distances calculated")
-    queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
     # we want to be able to add a 'big' neighborhood at the end, which happens to be queue_length
     remaining_capacity = queue_length * PARALLEL_VISIT_COUNT
     queue = Queue(
@@ -799,15 +799,12 @@ def generate_ann(primes: Tensor, vectors: Tensor) -> Tensor:
         print_timestamp(f"start of cagra loop {i}")
         closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
         # print_timestamp(f" closest vectors calculated")
-        print(f"queue at cagra loop {i}")
-        queue.print()
+        # print(f"queue at cagra loop {i}")
+        # queue.print()
         neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
-        print("neighborhoods")
-        print(neighborhoods)
-        print("neighborhood is cont")
-        print(neighborhoods.is_contiguous())
+        calculate_recall(vectors, neighborhoods.narrow_copy(1, 0, neighborhood_size))
         print_timestamp(f"end of cagra loop {i}")
-    return neighborhoods.narrow(1, 0, neighborhood_size)
+    return neighborhoods.narrow_copy(1, 0, neighborhood_size)
 
 
 """
@@ -852,18 +849,9 @@ def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
     return queue
 
 
-def recall_test(
-    number_of_vectors: int, dimensions: int = 2, neighborhood_size: int = 24
-):
-    # print_timestamp("recall test starts")
-    vectors = torch.nn.functional.normalize(
-        torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
-    )
-    # print_timestamp("vectors allocated")
-    neighborhoods = generate_ann(primes(neighborhood_size), vectors)
-    print(neighborhoods)
-    return
-    # print_timestamp("ann generated")
+def calculate_recall(vectors, neighborhoods):
+    (number_of_vectors, neighborhood_size) = neighborhoods.size()
+
     queue = initial_queue(vectors, neighborhood_size, 3 * neighborhood_size)
     # print_timestamp("queues allocated")
 
@@ -879,6 +867,22 @@ def recall_test(
 
     print(found)
     print(found / number_of_vectors)
+
+
+def recall_test(
+    number_of_vectors: int, dimensions: int = 1536, neighborhood_size: int = 24
+):
+    # print_timestamp("recall test starts")
+    vectors = torch.nn.functional.normalize(
+        torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
+    )
+    # print_timestamp("vectors allocated")
+    neighborhoods = generate_ann(neighborhood_size, vectors)
+    # print(neighborhoods)
+    # return
+    print_timestamp("ann generated")
+
+    calculate_recall(vectors, neighborhoods)
 
 
 # Function to print timestamps
@@ -920,4 +924,4 @@ if __name__ == "__main__":
     # ) as prof:
     #     prof.step()
     #     # with torch.profiler.record_function("recall_test"):
-    recall_test(10)
+    recall_test(2000)
