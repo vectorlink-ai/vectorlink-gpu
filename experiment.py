@@ -13,8 +13,8 @@ from numba import cuda, gdb_init, void, float32, int64, int32
 # INT32_MAX = int32(2147483647)
 # FLOAT32_MAX = float32(3.4028235e38)
 
-MAXINT = 999999
-MAXFLOAT = 999999.0
+MAXINT = 99_999_999
+MAXFLOAT = 99_999_999.0
 MAXINT_CUDA = int32(MAXINT)
 MAXFLOAT_CUDA = float32(MAXFLOAT)
 DEVICE = "cuda"
@@ -397,6 +397,20 @@ def cuda_search_from_seeds(
     return (index_out, distance_out)
 
 
+@cuda.jit
+def mark_kernel(tensor: Tensor):
+    pass
+
+
+@cuda.jit
+def punchout_kernel(tensor: Tensor):
+    pass
+
+
+def dedup_tensor(tensor: Tensor):
+    pass
+
+
 def comparison(qvs, nvs):
     with profiler.record_function("comparison"):
         batch_size, queue_size, vector_dim = nvs.size()
@@ -469,6 +483,7 @@ def search_from_seeds(
 
 PARALLEL_VISIT_COUNT = 3
 VISIT_QUEUE_LEN = 24 * 3
+EXCLUDE_FACTOR = 5
 
 
 def closest_vectors(
@@ -492,7 +507,9 @@ def closest_vectors(
         seen = (
             exclude
             if exclude is not None
-            else torch.empty((batch_size, 0), dtype=torch.int32)
+            else torch.empty(
+                (batch_size, VISIT_QUEUE_LEN * EXCLUDE_FACTOR), dtype=torch.int32
+            )
         )
         """
         Stream Diagram
@@ -577,11 +594,16 @@ def closest_vectors(
                 seen = add_new_to_seen(seen, indexes_of_comparisons)
                 record_stream(seen, s4)
 
+            if seen == None:
+                return False
+
             # print("seen 1")
             # print(seen)
             wait_stream(s1, s2)
             wait_stream(s1, s3)
             wait_stream(s1, s4)
+
+    return True
 
 
 def search_layers(
@@ -598,8 +620,35 @@ def search_from_initial():
 
 
 def add_new_to_seen(seen, indices):
-    seen = torch.concat([seen, indices], dim=1)
-    return shrink_to_fit(seen)
+    (dim1, dim2) = seen.size()
+    mask = seen == MAXINT
+    punched_mask = torch.all(mask, dim=0)
+    ascending = torch.arange(dim2)
+    match_indices = ascending[punched_mask]
+    (size,) = match_indices.size()
+    print(size)
+    if size == 0:
+        return None
+    else:
+        """
+        [ [ 0, 3,   999],
+          [ 1, 999, 999]
+        ]
+
+        [2] = [ 0 , 1,  2] [punch_mask]
+        """
+        first = match_indices[0]
+        (new_dim1, new_dim2) = indices.size()
+        remaining = dim2 - first
+        num_to_copy = min(remaining, new_dim2)
+        seen_tail = seen.narrow(1, first, remaining)
+        indices_tail = indices.narrow(1, 0, num_to_copy)
+        seen_tail.copy_(indices_tail)
+        (seen, _) = torch.sort(seen)
+        return seen
+
+
+#    return shrink_to_fit(seen)
 
 
 def shrink_to_fit(seen):
@@ -614,10 +663,11 @@ def shrink_to_fit(seen):
         (values, _) = values.sort()
         max_val_mask = values == MAXINT
         punched_mask = torch.all(max_val_mask, dim=0)
-        match_indices = torch.arange(dim2)[punched_mask]
+        index_upto_dim = torch.arange(dim2)
+        match_indices = index_upto_dim[punched_mask]
         (size,) = match_indices.size()
         if size > 0:
-            max_col = torch.arange(dim2)[punched_mask][0]
+            max_col = match_indices[0]
         else:
             max_col = 0
         return values.narrow(1, 0, max_col)
@@ -1203,6 +1253,13 @@ def generate_test_ann(
     neighborhood_primes = primes(queue_len)
     neighborhoods = generate_circulant_neighborhoods(vector_count, neighborhood_primes)
     neighborhood_distances = cuda_distances(vectors, neighborhoods)
+    queue = Queue(
+        num_vecs,
+        queue_length,
+        queue_length + remaining_capacity,
+    )
+
+    queue.insert(neighborhoods, neighborhood_distances)
 
 
 if __name__ == "__main__":
