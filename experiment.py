@@ -72,7 +72,7 @@ def log_time(func):
             return func(*args, **kwargs)
 
         (result, time) = timed(closure)
-        # print(f"time spent: {time}")
+        print(f"time spent: {time}")
         return result
 
     return wrapper
@@ -114,6 +114,23 @@ class Queue:
         (self.indices, self.distances) = queue_sort(self.indices, self.distances)
         did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
         return did_something_mask
+
+    def insert_random_padded(
+        self,
+        vector_id_batch: Tensor,
+        distances_batch: Tensor,
+        exclude: Optional[Tensor] = None,  # formatted like [[0],[1],[2]]
+    ):
+        (batch_size, total_length) = vector_id_batch.size()
+        (total_batch_size, _) = self.indices.size()
+        difference = total_batch_size - batch_size
+        random_padding = generate_circulant_neighborhoods(
+            difference, primes(total_length)
+        )
+        random_distances = distances(vectors, random_padding)
+        ids = torch.vstack([vector_id_batch, random_padding])
+        dist = torch.vstack([distances_batch, random_distances])
+        self.insert(ids, dist, exclude)
 
     def print(self, tail: Optional[bool] = False):
         (_bs, dim) = self.size()
@@ -257,6 +274,63 @@ def cuda_search_from_seeds_kernel(
             distance_out[batch_idx, output_idx] = result
     else:
         assert False
+
+
+@cuda.jit(
+    void(
+        float32[:, ::1],
+        int32[:, ::1],
+        float32[:, ::1],
+    )
+)
+def cuda_distances_kernel(
+    vectors: Tensor, neighborhoods: Tensor, distances_out: Tensor
+):
+    distance_buffer = numba.cuda.shared.array(4 * 1536, float32)
+
+    vector_id = cuda.blockIdx.x
+    neighborhood_idx = cuda.blockIdx.y
+    vector_group_idx = cuda.threadIdx.x
+
+    vector_dimension = vectors.shape[1]
+
+    vector = vectors[vector_id]
+    neighbor_id = neighborhoods[vector_id, neighborhood_idx]
+    if neighbor_id == MAXINT:
+        distances_out[vector_id, neighborhood_idx] = MAXFLOAT
+        return
+
+    neighbor_vector = vectors[neighbor_id]
+    result = cosine_distance(
+        vector, neighbor_vector, distance_buffer, vector_dimension, vector_group_idx
+    )
+    if vector_group_idx == 0:
+        distances_out[vector_id, neighborhood_idx] = result
+
+
+@log_time
+def cuda_distances(
+    vectors: Tensor, neighborhoods: Tensor, stream=None, distances_out=None
+):
+    (vector_count, vector_dimension) = vectors.size()
+    (_, neighborhood_size) = neighborhoods.size()
+
+    vector_idx_group_size = min(vector_dimension, 1024)
+    float_size = 4
+
+    grid = (vector_count, neighborhood_size, 1)
+    block = (vector_idx_group_size, 1, 1)
+
+    if not distances_out:
+        distances_out = torch.empty(
+            (vector_count, neighborhood_size), dtype=torch.float32
+        )
+
+    cuda_distances_kernel[grid, block, stream, vector_dimension * float_size](
+        vectors, neighborhoods, distances_out
+    )
+
+    return distances_out
 
 
 COUNT = 0
@@ -426,7 +500,7 @@ def closest_vectors(
         s1                       s2               s3              s4
         search_from_seeds--wait->|                |                |
         |                        |                |                |
-        search_queue_inesrt   rowwise -- wait --->|                |
+        search_queue_insert   rowwise -- wait --->|                |
         |                        |                |                |
         |               indexes of comp    distances of comp       |
         |                        |----------------o----------wait->|
@@ -650,6 +724,10 @@ def two_hop(ns: Tensor):
 
 
 def distances(vs: Tensor, neighborhoods: Tensor):
+    """
+    NOTE: Need a distances kernel!
+
+    """
     _, vec_dim = vs.size()
     number_of_vectors, neighborhood_size = neighborhoods.size()
     query_vector_indices = torch.arange(number_of_vectors)
@@ -860,7 +938,7 @@ def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
     return circulant_neighbors.sort().values % num_vecs
 
 
-def generate_hnsw(neighborhood_size: int, vectors: Tensor):
+def generate_layered_ann(neighborhood_size: int, vectors: Tensor):
     """ """
     layers = []
     (count, _) = vectors.size()
@@ -868,11 +946,63 @@ def generate_hnsw(neighborhood_size: int, vectors: Tensor):
     size = order
     while True:
         bound = min(size, count)
-        layers.append(generate_ann(neighborhood_size, vectors[0:bound]))
+        (ann, _) = generate_ann(neighborhood_size, vectors[0:bound])
+        layers.append(ann)
         if size > count:
             break
         else:
             size = order * size
+
+    return layers
+
+
+def generate_hnsw(neighborhood_size: int, vectors: Tensor):
+    """ """
+    (vector_count, _) = vectors.size()
+    order = neighborhood_size * 3
+    layer_size = order
+    bound = min(layer_size, vector_count)
+    (ann, distances) = generate_ann(neighborhood_size, vectors[0:bound])
+
+    layers = [ann]
+    queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
+    remaining_capacity = queue_length * PARALLEL_VISIT_COUNT
+
+    queue = Queue(
+        bound,
+        queue_length,
+        queue_length + remaining_capacity,
+    )  # make que from neighborhoods + neigbhorhood_distances
+    # print("neigbhorhoods")
+    # print(neighborhoods)
+    # print("neighborhood distances")
+    # print(neighborhood_distances)
+
+    c = 0
+    print(f"layer_size: {layer_size}, vector_count: {vector_count}")
+    while layer_size < vector_count:
+        layer_size = order * layer_size
+        bound = min(layer_size, vector_count)
+
+        print(f"round: {c}, size: {bound}")
+        queue = Queue(
+            bound,
+            queue_length,
+            queue_length + remaining_capacity,
+        )
+        queue.insert_random_padded(ann, distances)
+
+        qvs = vectors[:bound]
+        search_layers(layers, qvs, queue, vectors)
+
+        ann = queue.indices.narrow_copy(1, 0, neighborhood_size)
+        print(ann)
+        print(f"Isolated layer recall")
+        ann_calculate_recall(vectors[:bound], ann)
+        distances = queue.distances.narrow_copy(1, 0, neighborhood_size)
+
+        layers.append(ann)
+        c += 1
 
     return layers
 
@@ -915,7 +1045,10 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
             vectors, neighborhoods.narrow_copy(1, 0, neighborhood_size)
         )
         print_timestamp(f"end of cagra loop {i}")
-    return neighborhoods.narrow_copy(1, 0, neighborhood_size)
+    return (
+        neighborhoods.narrow_copy(1, 0, neighborhood_size),
+        queue.distances.narrow_copy(1, 0, neighborhood_size),
+    )
 
 
 """
@@ -1005,19 +1138,26 @@ def hnsw_calculate_recall(vectors, hnsw):
 
 def ann_recall_test(vectors: Tensor, neighborhood_size: int = 24):
     # print_timestamp("vectors allocated")
-    neighborhoods = generate_ann(neighborhood_size, vectors)
-    # print(neighborhoods)
-    # return
+    (neighborhoods, _) = generate_ann(neighborhood_size, vectors)
     print_timestamp("=> ANN generated")
 
     ann_calculate_recall(vectors, neighborhoods)
 
 
+def layered_ann_recall_test(vectors: Tensor, neighborhood_size: int = 24):
+    # print_timestamp("vectors allocated")
+    hnsw = generate_layered_ann(neighborhood_size, vectors)
+    print_timestamp("=> Layered ANN generated")
+    hnsw_calculate_recall(vectors, hnsw)
+
+
 def hnsw_recall_test(vectors: Tensor, neighborhood_size: int = 24):
     # print_timestamp("vectors allocated")
     hnsw = generate_hnsw(neighborhood_size, vectors)
-    # print(neighborhoods)
-    # return
+    for layer in hnsw:
+        (a, b) = layer.size()
+        print(f"shape: ({a}, {b})")
+
     print_timestamp("=> HNSW generated")
 
     hnsw_calculate_recall(vectors, hnsw)
@@ -1033,6 +1173,36 @@ def generate_random_vectors(number_of_vectors: int, dimensions: int = 1536) -> T
 # Function to print timestamps
 def print_timestamp(msg):
     print(msg)
+
+
+@log_time
+def test_sort(queue_len=128, vector_count=100):
+    indices = torch.randint(
+        0, vector_count, (vector_count, queue_len), dtype=torch.int32, device="cuda"
+    )
+    distances = torch.rand(
+        (vector_count, queue_len), dtype=torch.float32, device="cuda"
+    )
+    (distances, reorder) = torch.sort(distances)
+    indices = index_by_tensor(indices, reorder)
+    (indices, reorder) = torch.sort(indices, stable=True)
+    distances = index_by_tensor(distances, reorder)
+
+
+@log_time
+def generate_test_ann(
+    neighborhood_size=24, vector_dimension=1536, vector_count=1_000_000
+):
+    torch.set_default_device(DEVICE)
+    vectors = torch.nn.functional.normalize(
+        torch.randn(vector_count, vector_dimension, dtype=torch.float32, device="cuda"),
+        dim=1,
+    )
+
+    queue_len = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
+    neighborhood_primes = primes(queue_len)
+    neighborhoods = generate_circulant_neighborhoods(vector_count, neighborhood_primes)
+    neighborhood_distances = cuda_distances(vectors, neighborhoods)
 
 
 if __name__ == "__main__":
@@ -1069,8 +1239,10 @@ if __name__ == "__main__":
     # ) as prof:
     #     prof.step()
     #     # with torch.profiler.record_function("recall_test"):
-    vectors = generate_random_vectors(1000)
+    vectors = generate_random_vectors(10000)
     print("ANN >>>>>")
     ann_recall_test(vectors)
-    print("HNSW >>>>>")
-    hnsw_recall_test(vectors)
+    # print("HNSW >>>>>")
+    # hnsw_recall_test(vectors)
+    # print("LAYERED ANN >>>>>")
+    # layered_ann_recall_test(vectors)
