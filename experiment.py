@@ -1209,6 +1209,7 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
 
             remaining -= batch
 
+        remaining = num_vecs
         neighborhoods = next_neighborhoods
 
         prefix = min(vectors.size()[0], 1000)
