@@ -11,7 +11,7 @@ dependencies = [
     "datafusion>=42.0.0",
     "holistictraceanalysis>=0.2.0",
     "kmeans-gpu>=0.0.5",
-    "numpy>=2.1.3",
+    "numpy>=1.22,<2.1",
     "openai>=1.55.0",
     "pandas>=2.2.3",
     "pyarrow>=18.0.0",
@@ -21,6 +21,7 @@ dependencies = [
     "torch-tb-profiler>=0.4.3",
     "torch==2.5.0",
     "urllib3>=2.2.3",
+    "numba==0.61rc1",
 ]
 
 [build-system]
