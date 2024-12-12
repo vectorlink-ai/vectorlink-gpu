@@ -1181,9 +1181,14 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
         # print(f"queue at cagra loop {i}")
         # queue.print()
         neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
-        ann_calculate_recall(
-            vectors, neighborhoods.narrow_copy(1, 0, neighborhood_size)
+        prefix = min(vectors.size()[0], 1000)
+        (found, recall) = ann_calculate_recall(
+            vectors,
+            neighborhoods.narrow_copy(1, 0, neighborhood_size),
+            sample=vectors[:prefix],
         )
+        if recall == 1.0:
+            break
         print_timestamp(f"end of cagra loop {i}")
     return (
         neighborhoods.narrow_copy(1, 0, neighborhood_size),
@@ -1244,7 +1249,6 @@ def ann_calculate_recall(vectors, neighborhoods, sample: Optional = None):
     if sample is None:
         sample = vectors
     (sample_size, _) = sample.size()
-    (number_of_vectors, _) = vectors.size()
     (_, neighborhood_size) = neighborhoods.size()
 
     queue = initial_queue(
@@ -1260,9 +1264,9 @@ def ann_calculate_recall(vectors, neighborhoods, sample: Optional = None):
 
     # print_timestamp("calculated recall")
 
-    print(f"found: {found} / {number_of_vectors}")
-    print(f"recall: {found / number_of_vectors}")
-    return (found, found / number_of_vectors)
+    print(f"found: {found} / {sample_size}")
+    print(f"recall: {found / sample_size}")
+    return (found, found / sample_size)
 
 
 def hnsw_calculate_recall(vectors, hnsw):
@@ -1290,7 +1294,8 @@ def ann_recall_test(vectors: Tensor, neighborhood_size: int = 24):
     (neighborhoods, _) = generate_ann(neighborhood_size, vectors)
     print_timestamp("=> ANN generated")
 
-    ann_calculate_recall(vectors, neighborhoods)
+    prefix = min(vectors.size()[0], 1000)
+    ann_calculate_recall(vectors, neighborhoods, sample=vectors[:prefix])
 
 
 def layered_ann_recall_test(vectors: Tensor, neighborhood_size: int = 24):
@@ -1426,7 +1431,7 @@ if __name__ == "__main__":
     # ) as prof:
     #     prof.step()
     #     # with torch.profiler.record_function("recall_test"):
-    vectors = generate_random_vectors(1000)
+    vectors = generate_random_vectors(10000)
     print("ANN >>>>>")
     ann_recall_test(vectors)
     # print("HNSW >>>>>")
