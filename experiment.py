@@ -6,6 +6,7 @@ import sys
 from datetime import datetime
 import time
 import sys
+import argparse
 
 import numba
 from numba import cuda, gdb_init, void, float32, int64, int32
@@ -56,13 +57,15 @@ def record_stream(A, s):
 
 
 def timed(fn):
+    wall_start = time.time()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     result = fn()
     end.record()
+    wall_end = time.time()
     torch.cuda.synchronize()
-    return result, start.elapsed_time(end) / 1000
+    return result, start.elapsed_time(end) / 1000, (wall_end - wall_start)
 
 
 # print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] {msg}")
@@ -71,8 +74,8 @@ def log_time(func):
         def closure():
             return func(*args, **kwargs)
 
-        (result, time) = timed(closure)
-        print(f"[{func.__name__}] time spent: {time}")
+        (result, cuda_time, wall_time) = timed(closure)
+        print(f"[{func.__name__}]\n\tCUDA time: {cuda_time}\n\tWALL time {wall_time}")
         return result
 
     return wrapper
@@ -583,31 +586,7 @@ PARALLEL_VISIT_COUNT = 3
 VISIT_QUEUE_LEN = 24 * 3
 EXCLUDE_FACTOR = 5
 
-
-def closest_vectors(
-    query_vecs: Tensor,
-    search_queue: Queue,
-    vectors: Tensor,
-    neighborhoods: Tensor,
-    exclude: Optional[Tensor] = None,
-):
-    with profiler.record_function("closest_vectors"):
-        # print_timestamp("start of closest vectors")
-        (_, vector_dimension) = vectors.size()
-        (neighborhood_count, neighborhood_size) = neighborhoods.size()
-        extra_capacity = neighborhood_size * PARALLEL_VISIT_COUNT
-        (batch_size, queue_capacity) = search_queue.size()
-        capacity = VISIT_QUEUE_LEN + extra_capacity
-        visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
-        visit_queue.initialize_from_queue(search_queue)
-
-        did_something = torch.full([batch_size], True)
-        seen = torch.full(
-            (batch_size, VISIT_QUEUE_LEN * EXCLUDE_FACTOR),
-            MAXINT,
-            dtype=torch.int32,
-        )
-        """
+"""
         Stream Diagram
 
         s1                       s2               s3
@@ -641,40 +620,58 @@ def closest_vectors(
                                           back to search from seeds
         """
 
+
+@log_time
+def closest_vectors(
+    query_vecs: Tensor,
+    search_queue: Queue,
+    vectors: Tensor,
+    neighborhoods: Tensor,
+    exclude: Optional[Tensor] = None,
+):
+    with profiler.record_function("closest_vectors"):
+        # print_timestamp("start of closest vectors")
+        (_, vector_dimension) = vectors.size()
+        (neighborhood_count, neighborhood_size) = neighborhoods.size()
+        extra_capacity = neighborhood_size * PARALLEL_VISIT_COUNT
+        (batch_size, queue_capacity) = search_queue.size()
+        capacity = VISIT_QUEUE_LEN + extra_capacity
+        visit_queue = Queue(batch_size, VISIT_QUEUE_LEN, capacity)
+        visit_queue.initialize_from_queue(search_queue)
+
+        did_something = torch.full([batch_size], True)
+        seen = torch.full(
+            (batch_size, VISIT_QUEUE_LEN * EXCLUDE_FACTOR),
+            MAXINT,
+            dtype=torch.int32,
+        )
+
         while torch.any(did_something):
             # print_timestamp("start of loop")
+
             neighbors_to_visit = visit_queue.pop_n_ids(PARALLEL_VISIT_COUNT)
+
             if seen is not None:
                 seen = add_new_to_seen_(seen, neighbors_to_visit)
+
             (_, visit_length) = neighbors_to_visit.size()
             narrow_to = batch_size * visit_length * neighborhood_size
-            # print_timestamp("popped")
-            s1 = allocate_stream()
-            s2 = allocate_stream()
-            s3 = allocate_stream()
 
-            with current_stream(s1):
-                (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
-                    query_vecs,
-                    neighbors_to_visit,
-                    neighborhoods,
-                    vectors,
-                )
-            wait_stream(s2, s1)
-            # Search queue
-            with current_stream(s1):
-                did_something = search_queue.insert(
-                    indexes_of_comparisons, distances_of_comparisons, exclude=exclude
-                )
-            wait_stream(s2, s3)
-            with current_stream(s2):
-                if seen is not None:
-                    visit_queue.insert(
-                        indexes_of_comparisons, distances_of_comparisons, exclude=seen
-                    )
+            (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
+                query_vecs,
+                neighbors_to_visit,
+                neighborhoods,
+                vectors,
+            )
 
-            wait_stream(s1, s2)
-            wait_stream(s1, s3)
+            did_something = search_queue.insert(
+                indexes_of_comparisons, distances_of_comparisons, exclude=exclude
+            )
+            if seen is not None:
+                visit_queue.insert(
+                    indexes_of_comparisons, distances_of_comparisons, exclude=seen
+                )
+
     return True
 
 
@@ -1080,7 +1077,7 @@ def generate_layered_ann(neighborhood_size: int, vectors: Tensor):
     layers = []
     (count, _) = vectors.size()
     order = neighborhood_size * 3
-    size = order
+    size = 10_000
     while True:
         bound = min(size, count)
         (ann, _) = generate_ann(neighborhood_size, vectors[0:bound])
@@ -1269,24 +1266,29 @@ def ann_calculate_recall(vectors, neighborhoods, sample: Optional = None):
     return (found, found / sample_size)
 
 
-def hnsw_calculate_recall(vectors, hnsw):
-    (number_of_vectors, neighborhood_size) = hnsw[-1].size()
+def hnsw_calculate_recall(vectors, hnsw, sample: Optional = None):
+    if sample is None:
+        sample = vectors
+    (sample_size, _) = sample.size()
+
+    (_, neighborhood_size) = hnsw[-1].size()
 
     queue = initial_queue(
-        vectors, neighborhood_size, RECALL_SEARCH_QUEUE_LENGTH * neighborhood_size
+        sample, neighborhood_size, RECALL_SEARCH_QUEUE_LENGTH * neighborhood_size
     )
     # print_timestamp("queues allocated")
 
-    search_layers(hnsw, vectors, queue, vectors)
+    search_layers(hnsw, sample, queue, vectors)
     # print_timestamp("closest vectors calculated")
-    expected = torch.arange(number_of_vectors)
+    expected = torch.arange(sample_size)
     actual = queue.indices.t()[0]
     found = (expected == actual).sum().item()
 
     # print_timestamp("calculated recall")
 
-    print(found)
-    print(found / number_of_vectors)
+    print(f"found: {found} / {sample_size}")
+    print(f"recall: {found / sample_size}")
+    return (found, found / sample_size)
 
 
 def ann_recall_test(vectors: Tensor, neighborhood_size: int = 24):
@@ -1398,6 +1400,21 @@ def generate_test_ann(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-n", "--vector-count", help="number of vectors", type=int, default=10_000
+    )
+    parser.add_argument(
+        "-d", "--vector-dimension", help="dimension of vectors", type=int, default=1024
+    )
+    parser.add_argument(
+        "-l", "--layered", help="layered", default=False, action="store_true"
+    )
+    parser.add_argument(
+        "-c", "--cagra", help="cagra", default=False, action="store_true"
+    )
+    args = parser.parse_args()
+
     torch.set_default_device(DEVICE)
     torch.set_float32_matmul_precision("high")
 
@@ -1431,10 +1448,17 @@ if __name__ == "__main__":
     # ) as prof:
     #     prof.step()
     #     # with torch.profiler.record_function("recall_test"):
-    vectors = generate_random_vectors(10000)
-    print("ANN >>>>>")
-    ann_recall_test(vectors)
+    vectors = generate_random_vectors(
+        number_of_vectors=args.vector_count, dimensions=args.vector_dimension
+    )
+    if args.layered:
+        print("LAYERED ANN >>>>>")
+        layered_ann_recall_test(vectors)
+    else:
+        print("ANN >>>>>")
+        ann_recall_test(vectors)
+
+    # print("ANN >>>>>")
+    # ann_recall_test(vectors)
     # print("HNSW >>>>>")
     # hnsw_recall_test(vectors)
-    # print("LAYERED ANN >>>>>")
-    # layered_ann_recall_test(vectors)
