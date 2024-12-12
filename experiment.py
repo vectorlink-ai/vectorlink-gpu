@@ -82,9 +82,11 @@ class Queue:
     def __init__(self, num_queues: int, queue_length: int, capacity: int):
         assert queue_length < capacity
         self.length = queue_length
-        self.indices = torch.full((num_queues, capacity), MAXINT)
-        self.distances = torch.full((num_queues, capacity), MAXFLOAT)
-        self.buffers = torch.empty((num_queues, self.length))
+        self.indices = torch.full((num_queues, capacity), MAXINT, dtype=torch.int32)
+        self.distances = torch.full(
+            (num_queues, capacity), MAXFLOAT, dtype=torch.float32
+        )
+        self.buffers = torch.empty((num_queues, self.length), dtype=torch.int32)
 
     def initialize_from_queue(self, queue):
         head_length = min(queue.length, self.length)
@@ -97,7 +99,7 @@ class Queue:
         self,
         vector_id_batch: Tensor,
         distances_batch: Tensor,
-        exclude: Optional[Tensor] = None,  # formatted like [[0],[1],[2]]
+        exclude: Optional[Tensor] = None,  # formatted like [[0,MAXINT...],[1],[2]]
     ):
         self.buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
         (batches, size_per_batch) = vector_id_batch.size()
@@ -107,9 +109,7 @@ class Queue:
         distances_tail.copy_(distances_batch)
 
         if exclude is not None:
-            exclude_mask = indices_tail == exclude.expand(batches, size_per_batch)
-            indices_tail[exclude_mask] = MAXINT
-            distances_tail[exclude_mask] = MAXFLOAT
+            punchout_excluded(indices_tail, distances_tail, exclude)
 
         (self.indices, self.distances) = queue_sort(self.indices, self.distances)
         did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
@@ -127,7 +127,7 @@ class Queue:
         random_padding = generate_circulant_neighborhoods(
             difference, primes(total_length)
         )
-        random_distances = distances(vectors, random_padding)
+        random_distances = cuda_distances(vectors, random_padding)
         ids = torch.vstack([vector_id_batch, random_padding])
         dist = torch.vstack([distances_batch, random_distances])
         self.insert(ids, dist, exclude)
@@ -202,6 +202,22 @@ def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
     result = 1234.0
     if idx == 0:
         result = (1 - cos_theta) / 2
+        """
+        print(
+            "vec1: ",
+            vec1[0],
+            ",",
+            vec1[1],
+            "| vec2: ",
+            vec2[0],
+            ",",
+            vec2[1],
+            "cos_theta: ",
+            cos_theta,
+            "result: ",
+            result,
+        )
+        """
         if result < 0.0:
             result = 0.0
         elif result > 1.0:
@@ -294,17 +310,31 @@ def cuda_distances_kernel(
 
     vector_dimension = vectors.shape[1]
 
-    vector = vectors[vector_id]
     neighbor_id = neighborhoods[vector_id, neighborhood_idx]
     if neighbor_id == MAXINT:
         distances_out[vector_id, neighborhood_idx] = MAXFLOAT
         return
 
+    vector = vectors[vector_id]
     neighbor_vector = vectors[neighbor_id]
+
     result = cosine_distance(
         vector, neighbor_vector, distance_buffer, vector_dimension, vector_group_idx
     )
+
     if vector_group_idx == 0:
+        """
+        print(
+            "vector_id: ",
+            vector_id,
+            "neighborhood_idx: ",
+            neighborhood_idx,
+            "neighbor_id: ",
+            neighbor_id,
+            "result: ",
+            result,
+        )
+        """
         distances_out[vector_id, neighborhood_idx] = result
 
 
@@ -312,8 +342,17 @@ def cuda_distances_kernel(
 def cuda_distances(
     vectors: Tensor, neighborhoods: Tensor, stream=None, distances_out=None
 ):
+    assert vectors.dtype == torch.float32
+    assert vectors.is_contiguous()
+    assert neighborhoods.dtype == torch.int32
+    assert neighborhoods.is_contiguous()
+    if distances_out:
+        assert distances_out.is_contiguous()
+
     (vector_count, vector_dimension) = vectors.size()
-    (_, neighborhood_size) = neighborhoods.size()
+    (batches, neighborhood_size) = neighborhoods.size()
+
+    assert batches == vector_count
 
     vector_idx_group_size = min(vector_dimension, 1024)
     float_size = 4
@@ -344,10 +383,15 @@ def cuda_search_from_seeds(
 ) -> (Tensor, Tensor):
     global COUNT
 
+    assert query_vecs.dtype == torch.float32
     assert query_vecs.is_contiguous()
+    assert neighbors_to_visit.dtype == torch.int32
     assert neighbors_to_visit.is_contiguous()
+    assert neighborhoods.dtype == torch.int32
     assert neighborhoods.is_contiguous()
     assert vectors.is_contiguous()
+    assert vectors.dtype == torch.float32
+
     (batch_size, visit_length) = neighbors_to_visit.size()
     (_, neighborhood_size) = neighborhoods.size()
     (_, vector_dimension) = vectors.size()
@@ -355,9 +399,6 @@ def cuda_search_from_seeds(
     vector_idx_group_size = min(vector_dimension, 1024)
     float_size = 4
     # print(f"COUNT {COUNT}")
-
-    # print("index in")
-    # print(neighbors_to_visit)
 
     grid = (batch_size, visit_length, neighborhood_size)
     block = (vector_idx_group_size, 1, 1)
@@ -397,18 +438,75 @@ def cuda_search_from_seeds(
     return (index_out, distance_out)
 
 
-@cuda.jit
-def mark_kernel(tensor: Tensor):
-    pass
+@cuda.jit(void(int32[:, ::1]))
+def mark_kernel(indices: Tensor):
+    queue_len = indices.shape[1]
+
+    batch_idx = cuda.blockIdx.x
+    queue_idx = cuda.threadIdx.x
+    if queue_len > 1 and queue_idx < queue_len - 1:
+        flag = int32(1) << 30
+        bitmask = ~flag
+        left = indices[batch_idx, queue_idx] & bitmask
+        right = indices[batch_idx, queue_idx + 1] & bitmask
+        if left == right:
+            indices[batch_idx, queue_idx + 1] |= flag
 
 
-@cuda.jit
-def punchout_kernel(tensor: Tensor):
-    pass
+@cuda.jit(void(int32[:, ::1], float32[:, ::1]))
+def punchout_pair_kernel(indices: Tensor, distances: Tensor):
+    queue_len = indices.shape[1]
+
+    batch_idx = cuda.blockIdx.x
+    queue_idx = cuda.threadIdx.x
+
+    if queue_idx < queue_len:
+        flag = int32(1) << 30
+        bitmask = ~flag
+        value = indices[batch_idx, queue_idx]
+        if value & flag != 0:
+            indices[batch_idx, queue_idx] = MAXINT
+            distances[batch_idx, queue_idx] = MAXFLOAT
 
 
-def dedup_tensor(tensor: Tensor):
-    pass
+@cuda.jit(void(int32[:, ::1]))
+def punchout_kernel(indices: Tensor):
+    queue_len = indices.shape[1]
+
+    batch_idx = cuda.blockIdx.x
+    queue_idx = cuda.threadIdx.x
+
+    if queue_idx < queue_len:
+        flag = int32(1) << 30
+        bitmask = ~flag
+        value = indices[batch_idx, queue_idx]
+        if value & flag != 0:
+            indices[batch_idx, queue_idx] = MAXINT
+
+
+def dedup_tensor_(ids: Tensor, stream=None):
+    (batch_size, queue_size) = ids.size()
+    assert ids.is_contiguous()
+    assert ids.dtype == torch.int32
+    grid = (batch_size, 1, 1)
+    block = (queue_size, 1, 1)
+    mark_kernel[grid, block, stream, 0](ids)
+    punchout_kernel[grid, block, stream, 0](ids, distances)
+
+
+def dedup_tensor_pair_(ids: Tensor, distances: Tensor, stream=None):
+    """Assumes sorted tensors!"""
+    (batch_size, queue_size) = ids.size()
+    (batch_size2, queue_size2) = distances.size()
+    assert batch_size == batch_size2
+    assert queue_size == queue_size2
+    assert ids.is_contiguous()
+    assert distances.is_contiguous()
+
+    grid = (batch_size, 1, 1)
+    block = (queue_size, 1, 1)
+    mark_kernel[grid, block, stream, 0](ids)
+    punchout_pair_kernel[grid, block, stream, 0](ids, distances)
 
 
 def comparison(qvs, nvs):
@@ -504,28 +602,26 @@ def closest_vectors(
         visit_queue.initialize_from_queue(search_queue)
 
         did_something = torch.full([batch_size], True)
-        seen = (
-            exclude
-            if exclude is not None
-            else torch.empty(
-                (batch_size, VISIT_QUEUE_LEN * EXCLUDE_FACTOR), dtype=torch.int32
-            )
+        seen = torch.full(
+            (batch_size, VISIT_QUEUE_LEN * EXCLUDE_FACTOR),
+            MAXINT,
+            dtype=torch.int32,
         )
         """
         Stream Diagram
 
-        s1                       s2               s3              s4
-        search_from_seeds--wait->|                |                |
-        |                        |                |                |
-        search_queue_insert   rowwise -- wait --->|                |
-        |                        |                |                |
-        |               indexes of comp    distances of comp       |
-        |                        |----------------o----------wait->|
-        |                        |                |                |
-        |                        |<-wait----------|                |
-        |                 visit queue insert      |             add_new_to_seen
-        |                        |                |                |
-        |<-wait------------------o----------------o-----------------
+        s1                       s2               s3
+        search_from_seeds--wait->|                |
+        |                        |                |
+        search_queue_insert   rowwise -- wait --->|
+        |                        |                |
+        |               indexes of comp    distances of comp
+        |                        |                |
+        |                        |                |
+        |                        |<-wait----------|
+        |                 visit queue insert      |
+        |                        |                |
+        |<-wait------------------o-----------------
         |<-wait------------------|   U
 
         Stream DAG
@@ -535,11 +631,11 @@ def closest_vectors(
                         s1/       \\s2
         search_queue_insert        rowwise______________
                      s1|             |s2                \\ s3
-                       |    indexes of comparison_  ____distances of comparison
-                       |             |           \\/                      |
-                       |             |s2        s3/\\s4                   |s3
-                       |       visit_queue_insert   add_new_to_seen       |
-                      \\             |s2             |s4                 /
+                       |    indexes of comparison   ____distances of comparison
+                       |             |             /                      |
+                       |             |s2        s3/                       |s3
+                       |       visit_queue_insert                         |
+                      \\             |s2                                 /
                         ------------------------------------------------
                                                |
                                           back to search from seeds
@@ -547,15 +643,15 @@ def closest_vectors(
 
         while torch.any(did_something):
             # print_timestamp("start of loop")
-            # visit_queue.print()
             neighbors_to_visit = visit_queue.pop_n_ids(PARALLEL_VISIT_COUNT)
+            if seen is not None:
+                seen = add_new_to_seen_(seen, neighbors_to_visit)
             (_, visit_length) = neighbors_to_visit.size()
             narrow_to = batch_size * visit_length * neighborhood_size
             # print_timestamp("popped")
             s1 = allocate_stream()
             s2 = allocate_stream()
             s3 = allocate_stream()
-            s4 = allocate_stream()
 
             with current_stream(s1):
                 (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
@@ -570,39 +666,15 @@ def closest_vectors(
                 did_something = search_queue.insert(
                     indexes_of_comparisons, distances_of_comparisons, exclude=exclude
                 )
-
-            with current_stream(s2):
-                mask = rowwise_isin(indexes_of_comparisons, seen)
-
-            wait_stream(s3, s2)
-            with current_stream(s2):
-                indexes_of_comparisons[mask] = MAXINT
-                record_stream(indexes_of_comparisons, s2)
-
-            wait_stream(s4, s2)
-            with current_stream(s3):
-                distances_of_comparisons[mask] = MAXFLOAT
-                record_stream(indexes_of_comparisons, s3)
-
             wait_stream(s2, s3)
             with current_stream(s2):
-                visit_queue.insert(indexes_of_comparisons, distances_of_comparisons)
-            # print("seen 0")
-            # print(seen)
+                if seen is not None:
+                    visit_queue.insert(
+                        indexes_of_comparisons, distances_of_comparisons, exclude=seen
+                    )
 
-            with current_stream(s4):
-                seen = add_new_to_seen(seen, indexes_of_comparisons)
-                record_stream(seen, s4)
-
-            if seen == None:
-                return False
-
-            # print("seen 1")
-            # print(seen)
             wait_stream(s1, s2)
             wait_stream(s1, s3)
-            wait_stream(s1, s4)
-
     return True
 
 
@@ -615,18 +687,20 @@ def search_layers(
         closest_vectors(query_vecs, search_queue, vectors, layer, None)
 
 
-def search_from_initial():
-    pass
+def dedup_sort(tensor: Tensor):
+    (tensor, _) = tensor.sort()
+    dedup_tensor_(tensor)
+    (tensor, _) = tensor.sort()
+    return tensor
 
 
-def add_new_to_seen(seen, indices):
+def add_new_to_seen_(seen, indices):
     (dim1, dim2) = seen.size()
     mask = seen == MAXINT
     punched_mask = torch.all(mask, dim=0)
-    ascending = torch.arange(dim2)
+    ascending = torch.arange(dim2, dtype=torch.int32)
     match_indices = ascending[punched_mask]
     (size,) = match_indices.size()
-    print(size)
     if size == 0:
         return None
     else:
@@ -637,14 +711,17 @@ def add_new_to_seen(seen, indices):
 
         [2] = [ 0 , 1,  2] [punch_mask]
         """
+
         first = match_indices[0]
         (new_dim1, new_dim2) = indices.size()
         remaining = dim2 - first
         num_to_copy = min(remaining, new_dim2)
-        seen_tail = seen.narrow(1, first, remaining)
+        if num_to_copy == 0:
+            return seen
+        seen_tail = seen.narrow(1, first, num_to_copy)
         indices_tail = indices.narrow(1, 0, num_to_copy)
         seen_tail.copy_(indices_tail)
-        (seen, _) = torch.sort(seen)
+        seen.copy_(dedup_sort(seen))
         return seen
 
 
@@ -693,12 +770,22 @@ def shrink_to_fit_old(seen):
 
 def punch_out_duplicates(ids: Tensor, distances: Tensor):
     with profiler.record_function("punch_out_duplicates"):
-        dim1, dim2 = ids.size()
-        shifted_ids = torch.hstack([ids[:, 1:], torch.full([dim1, 1], MAXINT)])
-        mask = ids == shifted_ids
-        ids[mask] = MAXINT
-        distances[mask] = MAXFLOAT
-        return index_sort(ids, distances)
+        dedup_tensor_pair_(ids, distances)
+        (distances, perm) = distances.sort()
+        ids = index_by_tensor(ids, perm)
+        assert ids.dtype == torch.int32
+        assert distances.dtype == torch.float32
+        return (ids, distances)
+
+
+# def punch_out_duplicates(ids: Tensor, distances: Tensor):
+#     with profiler.record_function("punch_out_duplicates"):
+#         dim1, dim2 = ids.size()
+#         shifted_ids = torch.hstack([ids[:, 1:], torch.full([dim1, 1], MAXINT)])
+#         mask = ids == shifted_ids
+#         ids[mask] = MAXINT
+#         distances[mask] = MAXFLOAT
+#         return index_sort(ids, distances)
 
 
 def index_by_tensor(a: Tensor, b: Tensor):
@@ -980,7 +1067,7 @@ def primes(size: int):
 
 
 def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
-    indices = torch.arange(num_vecs, device=DEVICE)
+    indices = torch.arange(num_vecs, device=DEVICE, dtype=torch.int32)
     (nhs,) = primes.size()
     repeated_indices = indices.expand(nhs, num_vecs).transpose(0, 1)
     repeated_primes = primes.expand(num_vecs, nhs)
@@ -1067,8 +1154,10 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
     queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
     neighbor_primes = primes(queue_length)
     neighborhoods = generate_circulant_neighborhoods(num_vecs, neighbor_primes)
+    assert neighborhoods.dtype == torch.int32
     # print_timestamp("circulant neighborhoods generated")
-    neighborhood_distances = distances(vectors, neighborhoods)
+    neighborhood_distances = cuda_distances(vectors, neighborhoods)
+
     # print_timestamp("distances calculated")
     # we want to be able to add a 'big' neighborhood at the end, which happens to be queue_length
     remaining_capacity = queue_length * PARALLEL_VISIT_COUNT
@@ -1077,13 +1166,14 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
         queue_length,
         queue_length + remaining_capacity,
     )  # make que from neighborhoods + neigbhorhood_distances
+    queue.insert(neighborhoods, neighborhood_distances)
     # print("neigbhorhoods")
     # print(neighborhoods)
     # print("neighborhood distances")
     # print(neighborhood_distances)
-    queue.insert(neighborhoods, neighborhood_distances)
     # print_timestamp("initial queue constructed from neighborhoods")
-    exclude = torch.arange(num_vecs).unsqueeze(1)
+    exclude = excluding_self(num_vecs, queue_length)
+
     for i in range(0, CAGRA_LOOPS):
         print_timestamp(f"start of cagra loop {i}")
         closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
@@ -1101,29 +1191,33 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
     )
 
 
-"""
-1.
-Create circulants
-2. Search for candidate neighborhoods
-3. 
-"""
+@cuda.jit(void(int32[:, :], float32[:, :], int32[:, :]))
+def punchout_excluded_kernel(indices: Tensor, distances: Tensor, exclusions: Tensor):
+    exclusions_length = exclusions.shape[1]
+    batch_idx = cuda.blockIdx.x
+    queue_idx = cuda.threadIdx.x
+
+    value = indices[batch_idx, queue_idx]
+    for i in range(0, exclusions_length):
+        exclude = exclusions[batch_idx, i]
+        if exclude == MAXINT:
+            break
+        if value == exclude:
+            indices[batch_idx, queue_idx] = MAXINT
+            distances[batch_idx, queue_idx] = MAXFLOAT
 
 
-"""
-Example:
-
-thv = 8 x 4 x 2
-qvs = 8 x 2
-
-qvst = qvs.t().reshape(8, 2, 1)
-
-thv.bmm(qvst)
-
-"""
+def punchout_excluded(indices, distances, exclusions, stream=None):
+    (batch_size, queue_size) = indices.size()
+    (batch_size2, exclusion_size) = exclusions.size()
+    assert batch_size == batch_size2
+    grid = (batch_size, 1, 1)
+    block = (queue_size, 1, 1)
+    punchout_excluded_kernel[grid, block, stream, 0](indices, distances, exclusions)
 
 
-def rowwise_isin(tensor_1, target_tensor):
-    matches = tensor_1.unsqueeze(2) == target_tensor.unsqueeze(1)
+def rowwise_isin(indices, exclusions):
+    matches = indices.unsqueeze(2) == exclusions.unsqueeze(1)
 
     # result: boolean tensor of shape (N, K) where result[n, k] is torch.isin(tensor_1[n, k], target_tensor[n])
     result = torch.sum(matches, dim=2, dtype=torch.bool)
@@ -1137,7 +1231,7 @@ def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
     queue = Queue(batch_size, queue_size, queue_size + extra_capacity)
     p = primes(queue_size)
     initial_queue_indices = generate_circulant_neighborhoods(batch_size, p)
-    d = distances(vectors, initial_queue_indices)
+    d = cuda_distances(vectors, initial_queue_indices)
     queue.insert(initial_queue_indices, d)
 
     return queue
@@ -1239,27 +1333,53 @@ def test_sort(queue_len=128, vector_count=100):
     distances = index_by_tensor(distances, reorder)
 
 
+def excluding_self(num_vecs, queue_length):
+    exclude = torch.full(
+        (num_vecs, VISIT_QUEUE_LEN * EXCLUDE_FACTOR), MAXINT, dtype=torch.int32
+    )
+    exclude_front = exclude.narrow(1, 0, 1)
+    excluded_ids = torch.arange(num_vecs).unsqueeze(1)
+    exclude_front.copy_(excluded_ids)
+    return exclude
+
+
 @log_time
 def generate_test_ann(
     neighborhood_size=24, vector_dimension=1536, vector_count=1_000_000
 ):
     torch.set_default_device(DEVICE)
+    torch.set_float32_matmul_precision("high")
+
     vectors = torch.nn.functional.normalize(
         torch.randn(vector_count, vector_dimension, dtype=torch.float32, device="cuda"),
         dim=1,
     )
 
-    queue_len = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
-    neighborhood_primes = primes(queue_len)
+    queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
+    neighborhood_primes = primes(queue_length)
     neighborhoods = generate_circulant_neighborhoods(vector_count, neighborhood_primes)
     neighborhood_distances = cuda_distances(vectors, neighborhoods)
+    remaining_capacity = queue_length * PARALLEL_VISIT_COUNT
     queue = Queue(
-        num_vecs,
+        vector_count,
         queue_length,
         queue_length + remaining_capacity,
     )
-
     queue.insert(neighborhoods, neighborhood_distances)
+
+    exclude = excluding_self(vector_count, queue_length)
+
+    for i in range(0, CAGRA_LOOPS):
+        print_timestamp(f"start of cagra loop {i}")
+        closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
+        # print_timestamp(f" closest vectors calculated")
+        # print(f"queue at cagra loop {i}")
+        # queue.print()
+        neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
+        ann_calculate_recall(
+            vectors, neighborhoods.narrow_copy(1, 0, neighborhood_size)
+        )
+        print_timestamp(f"end of cagra loop {i}")
 
 
 if __name__ == "__main__":
@@ -1296,7 +1416,7 @@ if __name__ == "__main__":
     # ) as prof:
     #     prof.step()
     #     # with torch.profiler.record_function("recall_test"):
-    vectors = generate_random_vectors(10000)
+    vectors = generate_random_vectors(1000)
     print("ANN >>>>>")
     ann_recall_test(vectors)
     # print("HNSW >>>>>")
