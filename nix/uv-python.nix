@@ -1,4 +1,4 @@
-{pyproject-nix, pyproject-build-systems, cudaPackages, lib, workspace, python3, callPackage, glibc}:
+{pyproject-nix, pyproject-build-systems, cudaPackages, lib, workspace, python3, callPackage, glibc, tbb_2021_11}:
 let overlay = workspace.mkPyprojectOverlay {
       # Prefer prebuilt binary wheels as a package source.
       # Sdists are less likely to "just work" because of the metadata missing from uv.lock.
@@ -37,6 +37,8 @@ rm -f $out/lib/python3.12/site-packages/nvidia/__pycache__/__init__.cpython-312.
       "nvidia-nvjitlink-cu12"
       "nvidia-nvtx-cu12"
       "torch"
+      "taichi"
+      "numba"
     ];
     pyprojectOverrides = final: prev: {
       pybars3 = prev.pybars3.overrideAttrs (p:{
@@ -52,6 +54,9 @@ sed -i 's|/sbin/ldconfig|${glibc.bin}/bin/ldconfig|g' $out/lib/python3.12/site-p
 sed -i 's|/sbin/ldconfig|${glibc.bin}/bin/ldconfig|g' $out/lib/python3.12/site-packages/triton/backends/nvidia/driver.py
 '';
 */
+      });
+      numba = prev.numba.overrideAttrs (p: {
+        buildInputs = p.buildInputs ++ [tbb_2021_11];
       });
     };
 in
