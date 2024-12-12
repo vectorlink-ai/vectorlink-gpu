@@ -62,10 +62,10 @@ def timed(fn):
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     result = fn()
+    torch.cuda.synchronize()
     end.record()
     wall_end = time.time()
-    torch.cuda.synchronize()
-    return result, start.elapsed_time(end) / 1000, (wall_end - wall_start)
+    return result, start.elapsed_time(end) / 1_000, (wall_end - wall_start)
 
 
 # print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] {msg}")
