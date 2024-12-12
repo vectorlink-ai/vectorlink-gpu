@@ -28,23 +28,38 @@
   };
 
 
-  outputs = { nixpkgs, flake-utils, pyproject-nix, uv2nix, pyproject-build-systems, rust-overlay, ... }:
+  outputs = {
+      nixpkgs,
+      flake-utils,
+      pyproject-nix,
+      uv2nix,
+      pyproject-build-systems,
+      rust-overlay,
+      ...
+  }:
     flake-utils.lib.eachDefaultSystem (system:
-      let pkgs = import nixpkgs {
-            inherit system;
-
-            config = {
-              allowUnfree = true;
-              cudaSupport = true;
-            };
-            overlays = [(import rust-overlay)];
+      let
+        pkgs = import nixpkgs {
+          inherit system;
+          config = {
+            allowUnfree = true;
+            cudaSupport = true;
           };
-          workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
-          pythonSet = pkgs.callPackage ./nix/uv-python.nix {inherit pyproject-nix pyproject-build-systems workspace;}; in
+          overlays = [(import rust-overlay)];
+        };
+        workspace = uv2nix.lib.workspace.loadWorkspace {
+          workspaceRoot = ./.;
+        };
+        pythonSet = pkgs.callPackage ./nix/uv-python.nix {
+          inherit pyproject-nix pyproject-build-systems workspace;
+        };
+      in
       {
         devShells = {
           #default = pkgs.callPackage ./nix/shell.nix {inherit python3-base; };
-          default = pkgs.callPackage ./nix/uv-shell.nix {inherit workspace pythonSet;};
+          default = pkgs.callPackage ./nix/uv-shell.nix {
+            inherit workspace pythonSet;
+          };
         };
       }
   );
