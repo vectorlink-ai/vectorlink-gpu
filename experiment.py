@@ -54,7 +54,6 @@ def wait_stream(s1, s2):
 def record_stream(A, s):
     if False and torch.cuda.is_available():
         A.record_stream(s)
->>>>>>> cuda_cagra
 
 
 def timed(fn):
@@ -566,6 +565,7 @@ def cpu_search_from_seeds(
     return (indexes_of_comparisons, distances_from_comparison)
 
 
+# @log_time
 def search_from_seeds(
     query_vecs: Tensor,
     neighbors_to_visit: Tensor,
@@ -1159,33 +1159,66 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
     # print_timestamp("distances calculated")
     # we want to be able to add a 'big' neighborhood at the end, which happens to be queue_length
     remaining_capacity = queue_length * PARALLEL_VISIT_COUNT
-    queue = Queue(
-        num_vecs,
-        queue_length,
-        queue_length + remaining_capacity,
-    )  # make que from neighborhoods + neigbhorhood_distances
-    queue.insert(neighborhoods, neighborhood_distances)
+
+    # batch_size = 1000
+    batch_size = 10000
+    number_of_batches = int((num_vecs + batch_size - 1) / batch_size)
+    remaining = num_vecs
+
     # print("neigbhorhoods")
     # print(neighborhoods)
     # print("neighborhood distances")
     # print(neighborhood_distances)
     # print_timestamp("initial queue constructed from neighborhoods")
-    exclude = excluding_self(num_vecs, queue_length)
 
     for i in range(0, CAGRA_LOOPS):
         print_timestamp(f"start of cagra loop {i}")
-        closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
-        # print_timestamp(f" closest vectors calculated")
-        # print(f"queue at cagra loop {i}")
-        # queue.print()
-        neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
+        next_neighborhoods = torch.empty_like(neighborhoods)
+        for batch_count in range(0, number_of_batches):
+            print_timestamp(f"  start of batch loop {batch_count}")
+            batch_start_idx = batch_count * batch_size
+            batch = min(batch_size, remaining)
+            batch_end_idx = batch_count * batch_size + batch
+
+            exclude = excluding_self(batch_start_idx, batch_end_idx, queue_length)
+
+            queue = Queue(
+                batch,
+                queue_length,
+                queue_length + remaining_capacity,
+            )  # make que from neighborhoods + neigbhorhood_distances
+            neighborhoods_slice = neighborhoods.narrow(0, batch_start_idx, batch)
+            neighborhoods_distances_slice = neighborhood_distances.narrow(
+                0, batch_start_idx, batch
+            )
+            queue.insert(neighborhoods_slice, neighborhoods_distances_slice)
+
+            closest_vectors(
+                vectors[batch_start_idx:batch_end_idx],
+                queue,
+                vectors,
+                neighborhoods,
+                exclude,
+            )
+
+            next_neighborhoods_slice = next_neighborhoods.narrow(
+                0, batch_start_idx, batch
+            )
+            queue_indices = queue.indices.narrow(1, 0, queue_length)
+            next_neighborhoods_slice.copy_(queue_indices)
+
+            remaining -= batch
+
+        neighborhoods = next_neighborhoods
+
         prefix = min(vectors.size()[0], 1000)
         (found, recall) = ann_calculate_recall(
             vectors,
             neighborhoods.narrow_copy(1, 0, neighborhood_size),
             sample=vectors[:prefix],
         )
-        if recall == 1.0:
+
+        if recall == 1.0 or remaining <= 0:
             break
         print_timestamp(f"end of cagra loop {i}")
     return (
@@ -1346,12 +1379,10 @@ def test_sort(queue_len=128, vector_count=100):
     distances = index_by_tensor(distances, reorder)
 
 
-def excluding_self(num_vecs, queue_length):
-    exclude = torch.full(
-        (num_vecs, VISIT_QUEUE_LEN * EXCLUDE_FACTOR), MAXINT, dtype=torch.int32
-    )
+def excluding_self(start, end, queue_length):
+    exclude = torch.full((end - start, 1), MAXINT, dtype=torch.int32)
     exclude_front = exclude.narrow(1, 0, 1)
-    excluded_ids = torch.arange(num_vecs).unsqueeze(1)
+    excluded_ids = torch.arange(start, end, dtype=torch.int32).unsqueeze(1)
     exclude_front.copy_(excluded_ids)
     return exclude
 
