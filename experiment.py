@@ -1174,6 +1174,7 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
     for i in range(0, CAGRA_LOOPS):
         print_timestamp(f"start of cagra loop {i}")
         next_neighborhoods = torch.empty_like(neighborhoods)
+        next_neighborhood_distances = torch.empty_like(neighborhood_distances)
         for batch_count in range(0, number_of_batches):
             print_timestamp(f"  start of batch loop {batch_count}")
             batch_start_idx = batch_count * batch_size
@@ -1186,12 +1187,12 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
                 batch,
                 queue_length,
                 queue_length + remaining_capacity,
-            )  # make que from neighborhoods + neigbhorhood_distances
+            )
             neighborhoods_slice = neighborhoods.narrow(0, batch_start_idx, batch)
-            neighborhoods_distances_slice = neighborhood_distances.narrow(
+            neighborhood_distances_slice = neighborhood_distances.narrow(
                 0, batch_start_idx, batch
             )
-            queue.insert(neighborhoods_slice, neighborhoods_distances_slice)
+            queue.insert(neighborhoods_slice, neighborhood_distances_slice)
 
             closest_vectors(
                 vectors[batch_start_idx:batch_end_idx],
@@ -1204,13 +1205,20 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
             next_neighborhoods_slice = next_neighborhoods.narrow(
                 0, batch_start_idx, batch
             )
+            next_neighborhood_distance_slice = next_neighborhood_distances.narrow(
+                0, batch_start_idx, batch
+            )
             queue_indices = queue.indices.narrow(1, 0, queue_length)
+            queue_distances = queue.distances.narrow(1, 0, queue_length)
             next_neighborhoods_slice.copy_(queue_indices)
-
+            next_neighborhood_distance_slice.copy_(queue_distances)
             remaining -= batch
 
         remaining = num_vecs
-        neighborhoods = next_neighborhoods
+        ## We prune here!
+        (neighborhoods, distances) = prune(
+            next_neighborhoods, next_neighborhood_distances
+        )
 
         prefix = min(vectors.size()[0], 1000)
         (found, recall) = ann_calculate_recall(
@@ -1224,7 +1232,7 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
         print_timestamp(f"end of cagra loop {i}")
     return (
         neighborhoods.narrow_copy(1, 0, neighborhood_size),
-        queue.distances.narrow_copy(1, 0, neighborhood_size),
+        neighborhood_distances.narrow_copy(1, 0, neighborhood_size),
     )
 
 
@@ -1386,6 +1394,60 @@ def excluding_self(start, end, queue_length):
     excluded_ids = torch.arange(start, end, dtype=torch.int32).unsqueeze(1)
     exclude_front.copy_(excluded_ids)
     return exclude
+
+
+@cuda.jit(void(int32[:, ::1], float32[:, ::1]))
+def prune_kernel(beams, distances):
+    (_, beam_size) = beams.shape
+    node_x_id = cuda.blockIdx.x
+    x_link_y = cuda.blockIdx.y
+    y_link_z = cuda.threadIdx.y
+
+    node_y_id = beams[node_x_id, x_link_y]
+    if node_y_id == MAXINT:
+        return
+
+    node_z_id = beams[node_y_id, y_link_z]
+    if node_z_id == MAXINT:
+        return
+
+    x_link_z = MAXINT
+    for i in range(0, beam_size):
+        if node_z_id == beams[node_x_id, i]:
+            x_link_z = i
+
+    if x_link_z == MAXINT:
+        return
+
+    distance_xz = distances[node_x_id, x_link_z]
+    distance_xy = distances[node_x_id, x_link_y]
+    distance_yz = distances[node_y_id, y_link_z]
+
+    if (distance_xz > distance_xy) and (distance_xz > distance_yz):
+        beams[node_x_id, x_link_z] = MAXINT
+        distances[node_x_id, x_link_z] = MAXFLOAT
+
+
+"""
+Remove detourable links
+i.e. if d_xz > d_xy and d_xz > d_yz
+
+..since we'll be able to find z via y anyhow.
+"""
+
+
+def prune(beams, distances):
+    assert beams.dtype == torch.int32
+    assert distances.dtype == torch.float32
+
+    (batch_size, beam_size) = beams.size()
+    grid = (batch_size, beam_size, 1)
+    block = (beam_size, 1, 1)
+    prune_kernel[grid, block, None, 0](beams, distances)
+
+    (distances, permutation) = distances.sort()
+    beams = index_by_tensor(beams, permutation)
+    return (beams, distances)
 
 
 @log_time
