@@ -72,7 +72,7 @@ def log_time(func):
             return func(*args, **kwargs)
 
         (result, time) = timed(closure)
-        print(f"time spent: {time}")
+        print(f"[{func.__name__}] time spent: {time}")
         return result
 
     return wrapper
@@ -1240,24 +1240,29 @@ def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
 RECALL_SEARCH_QUEUE_LENGTH = 6
 
 
-def ann_calculate_recall(vectors, neighborhoods):
-    (number_of_vectors, neighborhood_size) = neighborhoods.size()
+def ann_calculate_recall(vectors, neighborhoods, sample: Optional = None):
+    if sample is None:
+        sample = vectors
+    (sample_size, _) = sample.size()
+    (number_of_vectors, _) = vectors.size()
+    (_, neighborhood_size) = neighborhoods.size()
 
     queue = initial_queue(
-        vectors, neighborhood_size, RECALL_SEARCH_QUEUE_LENGTH * neighborhood_size
+        sample, neighborhood_size, RECALL_SEARCH_QUEUE_LENGTH * neighborhood_size
     )
     # print_timestamp("queues allocated")
 
-    closest_vectors(vectors, queue, vectors, neighborhoods)
+    closest_vectors(sample, queue, vectors, neighborhoods)
     # print_timestamp("closest vectors calculated")
-    expected = torch.arange(number_of_vectors)
+    expected = torch.arange(sample_size)
     actual = queue.indices.t()[0]
     found = (expected == actual).sum().item()
 
     # print_timestamp("calculated recall")
 
-    print(found)
-    print(found / number_of_vectors)
+    print(f"found: {found} / {number_of_vectors}")
+    print(f"recall: {found / number_of_vectors}")
+    return (found, found / number_of_vectors)
 
 
 def hnsw_calculate_recall(vectors, hnsw):
@@ -1376,9 +1381,14 @@ def generate_test_ann(
         # print(f"queue at cagra loop {i}")
         # queue.print()
         neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
-        ann_calculate_recall(
-            vectors, neighborhoods.narrow_copy(1, 0, neighborhood_size)
+        prefix = min(1000, vector_count)
+        (found, recall) = ann_calculate_recall(
+            vectors,
+            neighborhoods.narrow_copy(1, 0, neighborhood_size),
+            sample=vectors[:prefix],
         )
+        if recall == 1.0:
+            break
         print_timestamp(f"end of cagra loop {i}")
 
 
