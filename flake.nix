@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:nixOS/nixpkgs?ref=nixos-unstable";
+    nixpkgs.url = "github:nixOS/nixpkgs?ref=nixos-24.11";
     flake-utils.url = "github:numtide/flake-utils";
     pyproject-nix = {
       url = "github:pyproject-nix/pyproject.nix";
