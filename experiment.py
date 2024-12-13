@@ -11,13 +11,12 @@ import argparse
 import numba
 from numba import cuda, gdb_init, void, float32, int64, int32
 
-# INT32_MAX = int32(2147483647)
-# FLOAT32_MAX = float32(3.4028235e38)
+# This gives more headroom, but is harder to read
+# MAXINT = 2147483647 # 2**31-1
+# MAXFLOAT = 3.4028235e38
 
 MAXINT = 99_999_999
 MAXFLOAT = 99_999_999.0
-MAXINT_CUDA = int32(MAXINT)
-MAXFLOAT_CUDA = float32(MAXFLOAT)
 DEVICE = "cuda"
 
 
@@ -786,6 +785,7 @@ def punch_out_duplicates(ids: Tensor, distances: Tensor):
 #         return index_sort(ids, distances)
 
 
+# Potentially can be made a kernel
 def index_by_tensor(a: Tensor, b: Tensor):
     with profiler.record_function("index_by_tensor"):
         dim1, dim2 = a.size()
@@ -812,20 +812,6 @@ def queue_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
     with profiler.record_function("queue_sort"):
         (ns, nds) = index_sort(neighborhoods, neighborhood_distances)
         return punch_out_duplicates(ns, nds)
-
-
-"""
-
-We can prune an edge as "detourable" if it is strictly less than the elements of a path, i.e.
-
-max(a,b) < c
-
-  a     b
-x -  y  - z
- '_______'
-    c
-
-"""
 
 
 def example_db():
@@ -873,12 +859,6 @@ def distances(vs: Tensor, neighborhoods: Tensor):
         number_of_vectors, neighborhood_size, vec_dim
     )
     return comparison(qvs, nvs)
-
-
-def prune(neighborhood: Tensor, neighborhood_distances: Tensor, vectors: Tensor):
-    two_hop_neighbors = two_hop(neighborhood)
-
-    pass
 
 
 PRIMES = torch.tensor(
@@ -1429,8 +1409,18 @@ def prune_kernel(beams, distances):
 
 
 """
-Remove detourable links
+Remove detourable links. Mark out with out-of-band value
+if we can reach x->z by another (better) path
+
 i.e. if d_xz > d_xy and d_xz > d_yz
+
+   prunable!
+   |
+x  v   z
+ . -> .
+ ↓  ↗
+  .
+ y
 
 ..since we'll be able to find z via y anyhow.
 """
