@@ -908,17 +908,18 @@ def generate_layered_ann(neighborhood_size: int, vectors: Tensor):
     return layers
 
 
-def generate_hnsw(neighborhood_size: int, vectors: Tensor):
+def generate_hnsw(vectors: Tensor, config: Dict):
     """ """
     (vector_count, _) = vectors.size()
+    neighborhood_size = config["neighborhood_size"]
     order = neighborhood_size * 3
     layer_size = order
     bound = min(layer_size, vector_count)
     (ann, distances) = generate_ann(neighborhood_size, vectors[0:bound])
 
     layers = [ann]
-    queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
-    remaining_capacity = queue_length * PARALLEL_VISIT_COUNT
+    queue_length = neighborhood_size * config["neighborhood_queue_factor"]
+    remaining_capacity = queue_length * config["parallel_visit_count"]
 
     queue = Queue(
         bound,
@@ -957,10 +958,6 @@ def generate_hnsw(neighborhood_size: int, vectors: Tensor):
         c += 1
 
     return layers
-
-
-NEIGHBORHOOD_QUEUE_FACTOR = 3
-CAGRA_LOOPS = 3
 
 
 def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
@@ -1027,10 +1024,17 @@ def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
             remaining -= batch
 
         remaining = num_vecs
+
         ## We prune here!
-        (neighborhoods, distances) = prune_(
-            next_neighborhoods, next_neighborhood_distances
-        )
+        if config["prune"]:
+            (neighborhoods, distances) = prune_(
+                next_neighborhoods, next_neighborhood_distances
+            )
+        else:
+            (neighborhoods, distances) = (
+                next_neighborhoods,
+                next_neighborhood_distances,
+            )
 
         prefix = min(vectors.size()[0], 1000)
         (found, recall) = ann_calculate_recall(
