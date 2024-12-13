@@ -129,7 +129,7 @@ class Queue:
         random_padding = generate_circulant_neighborhoods(
             difference, primes(total_length)
         )
-        random_distances = cuda_distances(vectors, random_padding)
+        random_distances = distances(vectors, random_padding)
         ids = torch.vstack([vector_id_batch, random_padding])
         dist = torch.vstack([distances_batch, random_distances])
         self.insert(ids, dist, exclude)
@@ -341,7 +341,7 @@ def cuda_distances_kernel(
 
 
 @log_time
-def cuda_distances(
+def distances(
     vectors: Tensor, neighborhoods: Tensor, stream=None, distances_out=None
 ):
     assert vectors.dtype == torch.float32
@@ -537,41 +537,6 @@ PARALLEL_VISIT_COUNT = 3
 VISIT_QUEUE_LEN = 24 * 3
 EXCLUDE_FACTOR = 5
 
-"""
-        Stream Diagram
-
-        s1                       s2               s3
-        search_from_seeds--wait->|                |
-        |                        |                |
-        search_queue_insert   rowwise -- wait --->|
-        |                        |                |
-        |               indexes of comp    distances of comp
-        |                        |                |
-        |                        |                |
-        |                        |<-wait----------|
-        |                 visit queue insert      |
-        |                        |                |
-        |<-wait------------------o-----------------
-        |<-wait------------------|   U
-
-        Stream DAG
-                                s1
-                                 |
-                           search_from_seeds
-                        s1/       \\s2
-        search_queue_insert        rowwise______________
-                     s1|             |s2                \\ s3
-                       |    indexes of comparison   ____distances of comparison
-                       |             |             /                      |
-                       |             |s2        s3/                       |s3
-                       |       visit_queue_insert                         |
-                      \\             |s2                                 /
-                        ------------------------------------------------
-                                               |
-                                          back to search from seeds
-        """
-
-
 @log_time
 def closest_vectors(
     query_vecs: Tensor,
@@ -683,7 +648,7 @@ def punch_out_duplicates_(ids: Tensor, distances: Tensor):
         return (ids, distances)
 
 
-# Potentially can be made a kernel
+# NOTE: Potentially can be made a kernel
 def index_by_tensor(a: Tensor, b: Tensor):
     with profiler.record_function("index_by_tensor"):
         dim1, dim2 = a.size()
@@ -740,23 +705,6 @@ def example_db():
 def two_hop(ns: Tensor):
     dim1, dim2 = ns.size()
     return ns.index_select(0, ns.flatten()).flatten().view(dim1, dim2 * dim2)
-
-
-def distances(vs: Tensor, neighborhoods: Tensor):
-    """
-    NOTE: Need a distances kernel!
-
-    """
-    _, vec_dim = vs.size()
-    number_of_vectors, neighborhood_size = neighborhoods.size()
-    query_vector_indices = torch.arange(number_of_vectors)
-    qvs = vs.index_select(0, query_vector_indices).reshape(
-        number_of_vectors, vec_dim, 1
-    )
-    nvs = vs.index_select(0, neighborhoods.flatten()).view(
-        number_of_vectors, neighborhood_size, vec_dim
-    )
-    return comparison(qvs, nvs)
 
 
 PRIMES = torch.tensor(
@@ -1032,7 +980,7 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
     neighborhoods = generate_circulant_neighborhoods(num_vecs, neighbor_primes)
     assert neighborhoods.dtype == torch.int32
     # print_timestamp("circulant neighborhoods generated")
-    neighborhood_distances = cuda_distances(vectors, neighborhoods)
+    neighborhood_distances = distances(vectors, neighborhoods)
 
     # print_timestamp("distances calculated")
     # we want to be able to add a 'big' neighborhood at the end, which happens to be queue_length
@@ -1145,7 +1093,7 @@ def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
     queue = Queue(batch_size, queue_size, queue_size + extra_capacity)
     p = primes(queue_size)
     initial_queue_indices = generate_circulant_neighborhoods(batch_size, p)
-    d = cuda_distances(vectors, initial_queue_indices)
+    d = distances(vectors, initial_queue_indices)
     queue.insert(initial_queue_indices, d)
 
     return queue
