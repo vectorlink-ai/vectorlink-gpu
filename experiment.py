@@ -521,11 +521,6 @@ def search_from_seeds(
         )
 
 
-PARALLEL_VISIT_COUNT = 3
-VISIT_QUEUE_LEN = 24 * 3
-EXCLUDE_FACTOR = 5
-
-
 @log_time
 def closest_vectors(
     query_vecs: Tensor,
@@ -1352,11 +1347,8 @@ if __name__ == "__main__":
     if args.layered:
         print("LAYERED ANN >>>>>")
         layered_ann_recall_test(vectors, build_params)
+        print("<<<<< FINISHED LAYERED ANN")
     else:
-        print("ANN >>>>>")
+        print("CAGRA ANN >>>>>")
         ann_recall_test(vectors, build_params)
-
-    # print("ANN >>>>>")
-    # ann_recall_test(vectors)
-    # print("HNSW >>>>>")
-    # hnsw_recall_test(vectors)
+        print("<<<<< FINISHED CAGRA")
