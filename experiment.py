@@ -520,50 +520,6 @@ def comparison(qvs, nvs):
         return results.reshape(batch_size, queue_size)
 
 
-def cpu_search_from_seeds(
-    query_vecs: Tensor,
-    neighbors_to_visit: Tensor,
-    neighborhoods: Tensor,
-    vectors: Tensor,
-):
-    # print_timestamp("start of search_from_seeds")
-    (batch_size, visit_length) = neighbors_to_visit.size()
-    (_, neighborhood_size) = neighborhoods.size()
-    (_, vector_dimension) = vectors.size()
-
-    # print_timestamp("making filter mask")
-    filter_mask = neighbors_to_visit == MAXINT
-    # print_timestamp("punchout")
-    neighbors_to_visit[filter_mask] = 0  # set to 0 to get a valid element
-    # print_timestamp("index select")
-    index_list = neighborhoods.index_select(0, neighbors_to_visit.flatten()).flatten()
-    # print_timestamp("index view")
-    indexes_of_comparisons = index_list.view(
-        batch_size, visit_length * neighborhood_size
-    )
-    print_timestamp("vectors")
-    # preallocated
-
-    vectors_for_comparison = torch.index_select(vectors, 0, index_list).view(
-        batch_size, visit_length * neighborhood_size, vector_dimension
-    )
-    print_timestamp("did index select")
-    # return (query_vecs, vectors_for_comparison)
-    # print_timestamp(" before compare")
-    distances_from_comparison = comparison(query_vecs, vectors_for_comparison)
-    # print_timestamp(" after compare")
-
-    expanded_filter_mask = (
-        filter_mask.reshape(batch_size, visit_length, 1)
-        .expand(batch_size, visit_length, neighborhood_size)
-        .reshape(batch_size, visit_length * neighborhood_size)
-    )
-    indexes_of_comparisons[expanded_filter_mask] = MAXINT
-    distances_from_comparison[expanded_filter_mask] = MAXFLOAT
-    # print_timestamp("end of search_from_seeds")
-    return (indexes_of_comparisons, distances_from_comparison)
-
-
 # @log_time
 def search_from_seeds(
     query_vecs: Tensor,
@@ -572,14 +528,9 @@ def search_from_seeds(
     vectors: Tensor,
 ):
     with profiler.record_function("search_from_seeds"):
-        if torch.cuda.is_available():
-            return cuda_search_from_seeds(
-                query_vecs, neighbors_to_visit, neighborhoods, vectors
-            )
-        else:
-            return cpu_search_from_seeds(
-                query_vecs, neighbors_to_visit, neighborhoods, vectors
-            )
+        return cuda_search_from_seeds(
+            query_vecs, neighbors_to_visit, neighborhoods, vectors
+        )
 
 
 PARALLEL_VISIT_COUNT = 3
