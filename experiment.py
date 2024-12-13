@@ -129,7 +129,7 @@ class Queue:
         random_padding = generate_circulant_neighborhoods(
             difference, primes(total_length)
         )
-        random_distances = distances(vectors, random_padding)
+        random_distances = calculate_distances(vectors, random_padding)
         ids = torch.vstack([vector_id_batch, random_padding])
         dist = torch.vstack([distances_batch, random_distances])
         self.insert(ids, dist, exclude)
@@ -341,7 +341,7 @@ def cuda_distances_kernel(
 
 
 @log_time
-def distances(
+def calculate_distances(
     vectors: Tensor, neighborhoods: Tensor, stream=None, distances_out=None
 ):
     assert vectors.dtype == torch.float32
@@ -493,7 +493,7 @@ def dedup_tensor_(ids: Tensor, stream=None):
     grid = (batch_size, 1, 1)
     block = (queue_size, 1, 1)
     mark_kernel[grid, block, stream, 0](ids)
-    punchout_kernel[grid, block, stream, 0](ids, distances)
+    punchout_kernel[grid, block, stream, 0](ids)
 
 
 def dedup_tensor_pair_(ids: Tensor, distances: Tensor, stream=None):
@@ -980,7 +980,7 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
     neighborhoods = generate_circulant_neighborhoods(num_vecs, neighbor_primes)
     assert neighborhoods.dtype == torch.int32
     # print_timestamp("circulant neighborhoods generated")
-    neighborhood_distances = distances(vectors, neighborhoods)
+    neighborhood_distances = calculate_distances(vectors, neighborhoods)
 
     # print_timestamp("distances calculated")
     # we want to be able to add a 'big' neighborhood at the end, which happens to be queue_length
@@ -1093,7 +1093,7 @@ def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
     queue = Queue(batch_size, queue_size, queue_size + extra_capacity)
     p = primes(queue_size)
     initial_queue_indices = generate_circulant_neighborhoods(batch_size, p)
-    d = distances(vectors, initial_queue_indices)
+    d = calculate_distances(vectors, initial_queue_indices)
     queue.insert(initial_queue_indices, d)
 
     return queue
