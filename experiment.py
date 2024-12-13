@@ -539,7 +539,7 @@ def closest_vectors(
         (neighborhood_count, neighborhood_size) = neighborhoods.size()
         extra_capacity = neighborhood_size * config["parallel_visit_count"]
         (batch_size, queue_capacity) = search_queue.size()
-        visit_queue_len = config["visit_queue_factor"] * neighborhood_size
+        visit_queue_len = config["visit_queue_factor"] * config["neighborhood_size"]
         capacity = visit_queue_len + extra_capacity
         visit_queue = Queue(batch_size, visit_queue_len, capacity)
         visit_queue.initialize_from_queue(search_queue)
@@ -1418,7 +1418,11 @@ if __name__ == "__main__":
         "-P", "--prune", help="prune beams", default=False, action="store_true"
     )
     parser.add_argument(
-        "-n", "--neighborhood_size", help="neighborhood size", type=int, default=24
+        "-n",
+        "--neighborhood_size",
+        help="beam or neighborhood size",
+        type=int,
+        default=24,
     )
     parser.add_argument("-l", "--cagra_loops", help="cagra loops", type=int, default=3)
     parser.add_argument(
@@ -1426,7 +1430,7 @@ if __name__ == "__main__":
         "--exclude_factor",
         help="factor larger than visit queue for exclusion buffer",
         type=int,
-        default=3,
+        default=5,
     )
     parser.add_argument(
         "-q",
