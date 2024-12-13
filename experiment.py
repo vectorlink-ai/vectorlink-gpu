@@ -111,7 +111,7 @@ class Queue:
         distances_tail.copy_(distances_batch)
 
         if exclude is not None:
-            punchout_excluded(indices_tail, distances_tail, exclude)
+            punchout_excluded_(indices_tail, distances_tail, exclude)
 
         (self.indices, self.distances) = queue_sort(self.indices, self.distances)
         did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
@@ -1196,7 +1196,7 @@ def generate_ann(neighborhood_size: int, vectors: Tensor) -> Tensor:
 
         remaining = num_vecs
         ## We prune here!
-        (neighborhoods, distances) = prune(
+        (neighborhoods, distances) = prune_(
             next_neighborhoods, next_neighborhood_distances
         )
 
@@ -1232,22 +1232,13 @@ def punchout_excluded_kernel(indices: Tensor, distances: Tensor, exclusions: Ten
             distances[batch_idx, queue_idx] = MAXFLOAT
 
 
-def punchout_excluded(indices, distances, exclusions, stream=None):
+def punchout_excluded_(indices, distances, exclusions, stream=None):
     (batch_size, queue_size) = indices.size()
     (batch_size2, exclusion_size) = exclusions.size()
     assert batch_size == batch_size2
     grid = (batch_size, 1, 1)
     block = (queue_size, 1, 1)
     punchout_excluded_kernel[grid, block, stream, 0](indices, distances, exclusions)
-
-
-def rowwise_isin(indices, exclusions):
-    matches = indices.unsqueeze(2) == exclusions.unsqueeze(1)
-
-    # result: boolean tensor of shape (N, K) where result[n, k] is torch.isin(tensor_1[n, k], target_tensor[n])
-    result = torch.sum(matches, dim=2, dtype=torch.bool)
-
-    return result
 
 
 def initial_queue(vectors: Tensor, neighborhood_size: int, queue_size: int):
@@ -1426,7 +1417,7 @@ x  v   z
 """
 
 
-def prune(beams, distances):
+def prune_(beams, distances):
     assert beams.dtype == torch.int32
     assert distances.dtype == torch.float32
 
