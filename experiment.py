@@ -673,50 +673,7 @@ def add_new_to_seen_(seen, indices):
         return seen
 
 
-#    return shrink_to_fit(seen)
-
-
-def shrink_to_fit(seen):
-    with profiler.record_function("shrink_to_fit"):
-        (values, _) = seen.sort()
-        (dim1, dim2) = seen.size()
-        shifted = torch.hstack(
-            [values[:, 1:], torch.full([dim1, 1], MAXINT, dtype=torch.int32)]
-        )
-        mask = values == shifted
-        values[mask] = MAXINT
-        (values, _) = values.sort()
-        max_val_mask = values == MAXINT
-        punched_mask = torch.all(max_val_mask, dim=0)
-        index_upto_dim = torch.arange(dim2)
-        match_indices = index_upto_dim[punched_mask]
-        (size,) = match_indices.size()
-        if size > 0:
-            max_col = match_indices[0]
-        else:
-            max_col = 0
-        return values.narrow(1, 0, max_col)
-
-
-def shrink_to_fit_old(seen):
-    with profiler.record_function("shrink_to_fit"):
-        (values, _) = seen.sort()
-        (dim1, dim2) = seen.size()
-        shifted = torch.hstack([values[:, 1:], torch.full([dim1, 1], MAXINT)])
-        mask = values == shifted
-        values[mask] = MAXINT
-        (values, _) = values.sort()
-        max_val_mask = values == MAXINT
-        nonzeroes = torch.nonzero(torch.all(max_val_mask, dim=0))
-        # print(nonzeroes.size())
-        # print(nonzeroes.size()[0])
-        if nonzeroes.size()[0] == 0:
-            return seen
-        max_col = (nonzeroes[0].sum() - 1).clamp(min=0)
-        return seen.narrow(1, 0, max_col)
-
-
-def punch_out_duplicates(ids: Tensor, distances: Tensor):
+def punch_out_duplicates_(ids: Tensor, distances: Tensor):
     with profiler.record_function("punch_out_duplicates"):
         dedup_tensor_pair_(ids, distances)
         (distances, perm) = distances.sort()
@@ -724,16 +681,6 @@ def punch_out_duplicates(ids: Tensor, distances: Tensor):
         assert ids.dtype == torch.int32
         assert distances.dtype == torch.float32
         return (ids, distances)
-
-
-# def punch_out_duplicates(ids: Tensor, distances: Tensor):
-#     with profiler.record_function("punch_out_duplicates"):
-#         dim1, dim2 = ids.size()
-#         shifted_ids = torch.hstack([ids[:, 1:], torch.full([dim1, 1], MAXINT)])
-#         mask = ids == shifted_ids
-#         ids[mask] = MAXINT
-#         distances[mask] = MAXFLOAT
-#         return index_sort(ids, distances)
 
 
 # Potentially can be made a kernel
@@ -762,7 +709,7 @@ def index_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
 def queue_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
     with profiler.record_function("queue_sort"):
         (ns, nds) = index_sort(neighborhoods, neighborhood_distances)
-        return punch_out_duplicates(ns, nds)
+        return punch_out_duplicates_(ns, nds)
 
 
 def example_db():
@@ -1350,7 +1297,8 @@ def prune_kernel(beams, distances):
         distances[node_x_id, x_link_z] = MAXFLOAT
 
 
-"""
+def prune_(beams, distances):
+    """
 Remove detourable links. Mark out with out-of-band value
 if we can reach x->z by another (better) path
 
@@ -1366,9 +1314,6 @@ x  v   z
 
 ..since we'll be able to find z via y anyhow.
 """
-
-
-def prune_(beams, distances):
     assert beams.dtype == torch.int32
     assert distances.dtype == torch.float32
 
@@ -1381,49 +1326,6 @@ def prune_(beams, distances):
     beams = index_by_tensor(beams, permutation)
     return (beams, distances)
 
-
-@log_time
-def generate_test_ann(
-    neighborhood_size=24, vector_dimension=1536, vector_count=1_000_000
-):
-    torch.set_default_device(DEVICE)
-    torch.set_float32_matmul_precision("high")
-
-    vectors = torch.nn.functional.normalize(
-        torch.randn(vector_count, vector_dimension, dtype=torch.float32, device="cuda"),
-        dim=1,
-    )
-
-    queue_length = neighborhood_size * NEIGHBORHOOD_QUEUE_FACTOR
-    neighborhood_primes = primes(queue_length)
-    neighborhoods = generate_circulant_neighborhoods(vector_count, neighborhood_primes)
-    neighborhood_distances = cuda_distances(vectors, neighborhoods)
-    remaining_capacity = queue_length * PARALLEL_VISIT_COUNT
-    queue = Queue(
-        vector_count,
-        queue_length,
-        queue_length + remaining_capacity,
-    )
-    queue.insert(neighborhoods, neighborhood_distances)
-
-    exclude = excluding_self(vector_count, queue_length)
-
-    for i in range(0, CAGRA_LOOPS):
-        print_timestamp(f"start of cagra loop {i}")
-        closest_vectors(vectors, queue, vectors, neighborhoods, exclude)
-        # print_timestamp(f" closest vectors calculated")
-        # print(f"queue at cagra loop {i}")
-        # queue.print()
-        neighborhoods = queue.indices.narrow_copy(1, 0, queue_length)
-        prefix = min(1000, vector_count)
-        (found, recall) = ann_calculate_recall(
-            vectors,
-            neighborhoods.narrow_copy(1, 0, neighborhood_size),
-            sample=vectors[:prefix],
-        )
-        if recall == 1.0:
-            break
-        print_timestamp(f"end of cagra loop {i}")
 
 
 if __name__ == "__main__":
