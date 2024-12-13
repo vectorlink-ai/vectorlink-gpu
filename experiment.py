@@ -1093,9 +1093,6 @@ def initial_queue(vectors: Tensor, config: Dict):
     return queue
 
 
-RECALL_SEARCH_QUEUE_LENGTH = 6
-
-
 def ann_calculate_recall(vectors, neighborhoods, config: Dict, sample: Optional = None):
     if sample is None:
         sample = vectors
@@ -1125,7 +1122,7 @@ def hnsw_calculate_recall(vectors, hnsw, config: Dict, sample: Optional = None):
 
     (_, neighborhood_size) = hnsw[-1].size()
 
-    queue = initial_queue(sample, neighborhood_size, config)
+    queue = initial_queue(sample, config)
     # print_timestamp("queues allocated")
 
     search_layers(hnsw, sample, queue, vectors)
