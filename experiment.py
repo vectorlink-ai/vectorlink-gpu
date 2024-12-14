@@ -6,8 +6,10 @@ import sys
 from datetime import datetime
 import time
 import sys
+import subprocess
 import argparse
 from typing import Dict
+import json
 
 import numba
 from numba import cuda, gdb_init, void, float32, int64, int32
@@ -1103,15 +1105,16 @@ def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
     return circulant_neighbors.sort().values % num_vecs
 
 
-def generate_layered_ann(neighborhood_size: int, vectors: Tensor):
+def generate_layered_ann(vectors: Tensor, config: Dict):
     """ """
+    neighborhood_size = config.neighborhood_size
     layers = []
     (count, _) = vectors.size()
     order = neighborhood_size * 3
     size = 10_000
     while True:
         bound = min(size, count)
-        (ann, _) = generate_ann(neighborhood_size, vectors[0:bound])
+        (ann, _) = generate_ann(vectors[0:bound], config)
         layers.append(ann)
         if size > count:
             break
@@ -1306,7 +1309,12 @@ def initial_queue(vectors: Tensor, config: Dict):
     return queue
 
 
-def ann_calculate_recall(vectors, neighborhoods, config: Dict, sample: Optional = None):
+def ann_calculate_recall(
+    vectors: Tensor,
+    neighborhoods: Tensor,
+    config: Dict,
+    sample: Optional[Tensor] = None,
+):
     if sample is None:
         sample = vectors
     (sample_size, _) = sample.size()
@@ -1328,7 +1336,9 @@ def ann_calculate_recall(vectors, neighborhoods, config: Dict, sample: Optional 
     return (found, found / sample_size)
 
 
-def hnsw_calculate_recall(vectors, hnsw, config: Dict, sample: Optional = None):
+def hnsw_calculate_recall(
+    vectors: Tensor, hnsw: List[Tensor], config: Dict, sample: Optional[Tensor] = None
+):
     if sample is None:
         sample = vectors
     (sample_size, _) = sample.size()
@@ -1338,7 +1348,7 @@ def hnsw_calculate_recall(vectors, hnsw, config: Dict, sample: Optional = None):
     queue = initial_queue(sample, config)
     # print_timestamp("queues allocated")
 
-    search_layers(hnsw, sample, queue, vectors)
+    search_layers(hnsw, sample, queue, vectors, config)
     # print_timestamp("closest vectors calculated")
     expected = torch.arange(sample_size)
     actual = queue.indices.t()[0]
@@ -1351,20 +1361,20 @@ def hnsw_calculate_recall(vectors, hnsw, config: Dict, sample: Optional = None):
     return (found, found / sample_size)
 
 
-def ann_recall_test(vectors: Tensor, config):
+def ann_recall_test(vectors: Tensor, config: Dict):
     # print_timestamp("vectors allocated")
     (neighborhoods, _) = generate_ann(vectors, config)
     print_timestamp("=> ANN generated")
 
     prefix = min(vectors.size()[0], 1000)
-    ann_calculate_recall(vectors, neighborhoods, config, sample=vectors[:prefix])
+    return ann_calculate_recall(vectors, neighborhoods, config, sample=vectors[:prefix])
 
 
 def layered_ann_recall_test(vectors: Tensor, config):
     # print_timestamp("vectors allocated")
     hnsw = generate_layered_ann(vectors, config)
     print_timestamp("=> Layered ANN generated")
-    hnsw_calculate_recall(vectors, hnsw, config)
+    return hnsw_calculate_recall(vectors, hnsw, config)
 
 
 def hnsw_recall_test(vectors: Tensor, config):
@@ -1562,11 +1572,20 @@ if __name__ == "__main__":
     vectors = generate_random_vectors(
         number_of_vectors=args.vector_count, dimensions=args.vector_dimension
     )
+    recall = 0.0
     if args.layered:
         print("LAYERED ANN >>>>>")
-        layered_ann_recall_test(vectors, build_params)
+        (_, recall) = layered_ann_recall_test(vectors, build_params)
         print("<<<<< FINISHED LAYERED ANN")
     else:
         print("CAGRA ANN >>>>>")
-        ann_recall_test(vectors, build_params)
+        (_, recall) = ann_recall_test(vectors, build_params)
         print("<<<<< FINISHED CAGRA")
+
+    commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
+
+    build_params["commit"] = commit
+    build_params["recall"] = recall
+    log_name = f"experiment-{time.time()}.log"
+    with open(log_name, "w") as w:
+        json.dump(build_params, w)
