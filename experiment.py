@@ -64,6 +64,7 @@ def timed(fn):
     result = fn()
     torch.cuda.synchronize()
     end.record()
+    torch.cuda.synchronize()
     wall_end = time.time()
     return result, start.elapsed_time(end) / 1_000, (wall_end - wall_start)
 
@@ -1508,14 +1509,21 @@ def prune_(beams, distances):
 
 
 def grid_search():
+    torch.set_default_device(DEVICE)
+    torch.set_float32_matmul_precision("high")
     config = {
         "type": "cagra",
         "vector_count": 1_000_000,
         "vector_dimension": 1536,
         "exclude_factor": 5,
         "batch_size": 10_000,
+        "neigbhorhood_size": 32,
+        "neighborhood_queue_factor": 3,
         "recall_search_queue_factor": 6,
     }
+    vectors = generate_random_vectors(
+        number_of_vectors=config["vector_count"], dimensions=config["vector_dimension"]
+    )
 
     os.makedirs("./grid-log", exist_ok=True)
     for prune in [True, False]:
@@ -1524,9 +1532,10 @@ def grid_search():
                 for cagra_loops in [1, 2]:
                     for visit_queue_factor in [3, 4]:
                         config["prune"] = prune
-                        config["neigbhorhood_size"] = neighborhood_size
+                        config["neighborhood_size"] = neighborhood_size
                         config["parallel_visit_count"] = parallel_visit_count
                         config["visit_queue_factor"] = visit_queue_factor
+                        config["cagra_loops"] = cagra_loops
                         result = main(vectors, config)
                         log_name = f"./grid-log/experiment-{time.time()}.log"
                         with open(log_name, "w") as w:
@@ -1534,23 +1543,26 @@ def grid_search():
 
 
 def main(vectors, configuration):
+    start = time.time()
     recall = 0.0
     if configuration["type"] == "layered":
         print("LAYERED ANN >>>>>")
-        (_, recall) = layered_ann_recall_test(vectors, build_params)
+        (_, recall) = layered_ann_recall_test(vectors, configuration)
         print("<<<<< FINISHED LAYERED ANN")
     else:
         print("CAGRA ANN >>>>>")
-        (_, recall) = ann_recall_test(vectors, build_params)
+        (_, recall) = ann_recall_test(vectors, configuration)
         print("<<<<< FINISHED CAGRA")
 
+    end = time.time()
+    configuration["construction_time"] = end - start
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
 
     configuration["commit"] = commit.decode("utf-8").strip()
     configuration["recall"] = recall
     configuration["closest_vectors_batch_time"] = CLOSEST_VECTORS_BATCH_TIME
 
-    return build_params
+    return configuration
 
 
 if __name__ == "__main__":
@@ -1643,6 +1655,7 @@ if __name__ == "__main__":
     vectors = generate_random_vectors(
         number_of_vectors=args.vector_count, dimensions=args.vector_dimension
     )
+
     configuration = main(vectors, build_params)
 
     os.makedirs("./log", exist_ok=True)
