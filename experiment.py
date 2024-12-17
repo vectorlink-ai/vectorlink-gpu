@@ -1507,6 +1507,52 @@ def prune_(beams, distances):
     return (beams, distances)
 
 
+def grid_search():
+    config = {
+        "type": "cagra",
+        "vector_count": 1_000_000,
+        "vector_dimension": 1536,
+        "exclude_factor": 5,
+        "batch_size": 10_000,
+        "recall_search_queue_factor": 6,
+    }
+
+    os.makedirs("./grid-log", exist_ok=True)
+    for prune in [True, False]:
+        for neighborhood_size in [24, 32, 46]:
+            for parallel_visit_count in [1, 4]:
+                for cagra_loops in [1, 2]:
+                    for visit_queue_factor in [3, 4]:
+                        config["prune"] = prune
+                        config["neigbhorhood_size"] = neighborhood_size
+                        config["parallel_visit_count"] = parallel_visit_count
+                        config["visit_queue_factor"] = visit_queue_factor
+                        result = main(vectors, config)
+                        log_name = f"./grid-log/experiment-{time.time()}.log"
+                        with open(log_name, "w") as w:
+                            json.dump(result, w)
+
+
+def main(vectors, configuration):
+    recall = 0.0
+    if configuration["type"] == "layered":
+        print("LAYERED ANN >>>>>")
+        (_, recall) = layered_ann_recall_test(vectors, build_params)
+        print("<<<<< FINISHED LAYERED ANN")
+    else:
+        print("CAGRA ANN >>>>>")
+        (_, recall) = ann_recall_test(vectors, build_params)
+        print("<<<<< FINISHED CAGRA")
+
+    commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
+
+    configuration["commit"] = commit.decode("utf-8").strip()
+    configuration["recall"] = recall
+    configuration["closest_vectors_batch_time"] = CLOSEST_VECTORS_BATCH_TIME
+
+    return build_params
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1597,23 +1643,10 @@ if __name__ == "__main__":
     vectors = generate_random_vectors(
         number_of_vectors=args.vector_count, dimensions=args.vector_dimension
     )
-    recall = 0.0
-    if args.layered:
-        print("LAYERED ANN >>>>>")
-        (_, recall) = layered_ann_recall_test(vectors, build_params)
-        print("<<<<< FINISHED LAYERED ANN")
-    else:
-        print("CAGRA ANN >>>>>")
-        (_, recall) = ann_recall_test(vectors, build_params)
-        print("<<<<< FINISHED CAGRA")
-
-    commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
+    configuration = main(vectors, build_params)
 
     os.makedirs("./log", exist_ok=True)
-    build_params["commit"] = commit.decode("utf-8").strip()
-    build_params["recall"] = recall
-    build_params["closest_vectors_batch_time"] = CLOSEST_VECTORS_BATCH_TIME
     log_name = f"./log/experiment-{time.time()}.log"
     with open(log_name, "w") as w:
-        print(build_params)
-        json.dump(build_params, w)
+        print(configuration)
+        json.dump(configuration, w)
