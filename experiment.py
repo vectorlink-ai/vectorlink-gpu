@@ -6,6 +6,7 @@ import sys
 from datetime import datetime
 import time
 import sys
+import os
 import subprocess
 import argparse
 from typing import Dict
@@ -68,13 +69,22 @@ def timed(fn):
 
 
 # print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] {msg}")
+CLOSEST_VECTORS_BATCH_TIME = 0.0
+
+
 def log_time(func):
+    global CLOSEST_VECTORS_BATCH_TIME
+
     def wrapper(*args, **kwargs):
+        global CLOSEST_VECTORS_BATCH_TIME
+
         def closure():
             return func(*args, **kwargs)
 
         (result, cuda_time, wall_time) = timed(closure)
         print(f"[{func.__name__}]\n\tCUDA time: {cuda_time}\n\tWALL time {wall_time}")
+        if func.__name__ == "closest_vectors":
+            CLOSEST_VECTORS_BATCH_TIME = max(wall_time, CLOSEST_VECTORS_BATCH_TIME)
         return result
 
     return wrapper
@@ -435,14 +445,18 @@ def mark_kernel(indices: Tensor):
     queue_len = indices.shape[1]
 
     batch_idx = cuda.blockIdx.x
-    queue_idx = cuda.threadIdx.x
-    if queue_len > 1 and queue_idx < queue_len - 1:
-        flag = int32(1) << 30
-        bitmask = ~flag
-        left = indices[batch_idx, queue_idx] & bitmask
-        right = indices[batch_idx, queue_idx + 1] & bitmask
-        if left == right:
-            indices[batch_idx, queue_idx + 1] |= flag
+    queue_group_idx = cuda.threadIdx.x
+
+    groups = int((queue_len + 1023) / 1024)
+    for group in range(0, groups):
+        queue_idx = 1024 * group + queue_group_idx
+        if queue_len > 1 and queue_idx < queue_len - 1:
+            flag = int32(1) << 30
+            bitmask = ~flag
+            left = indices[batch_idx, queue_idx] & bitmask
+            right = indices[batch_idx, queue_idx + 1] & bitmask
+            if left == right:
+                indices[batch_idx, queue_idx + 1] |= flag
 
 
 @cuda.jit(void(int32[:, ::1], float32[:, ::1]))
@@ -450,15 +464,18 @@ def punchout_pair_kernel(indices: Tensor, distances: Tensor):
     queue_len = indices.shape[1]
 
     batch_idx = cuda.blockIdx.x
-    queue_idx = cuda.threadIdx.x
+    queue_group_idx = cuda.threadIdx.x
 
-    if queue_idx < queue_len:
-        flag = int32(1) << 30
-        bitmask = ~flag
-        value = indices[batch_idx, queue_idx]
-        if value & flag != 0:
-            indices[batch_idx, queue_idx] = MAXINT
-            distances[batch_idx, queue_idx] = MAXFLOAT
+    groups = int((queue_len + 1023) / 1024)
+    for group in range(0, groups):
+        queue_idx = 1024 * group + queue_group_idx
+        if queue_idx < queue_len:
+            flag = int32(1) << 30
+            bitmask = ~flag
+            value = indices[batch_idx, queue_idx]
+            if value & flag != 0:
+                indices[batch_idx, queue_idx] = MAXINT
+                distances[batch_idx, queue_idx] = MAXFLOAT
 
 
 @cuda.jit(void(int32[:, ::1]))
@@ -466,21 +483,25 @@ def punchout_kernel(indices: Tensor):
     queue_len = indices.shape[1]
 
     batch_idx = cuda.blockIdx.x
-    queue_idx = cuda.threadIdx.x
+    queue_group_idx = cuda.threadIdx.x
 
-    if queue_idx < queue_len:
-        flag = int32(1) << 30
-        bitmask = ~flag
-        value = indices[batch_idx, queue_idx]
-        if value & flag != 0:
-            indices[batch_idx, queue_idx] = MAXINT
+    groups = int((queue_len + 1023) / 1024)
+    for group in range(0, groups):
+        queue_idx = 1024 * group + queue_group_idx
+        if queue_idx < queue_len:
+            flag = int32(1) << 30
+            bitmask = ~flag
+            value = indices[batch_idx, queue_idx]
+            if value & flag != 0:
+                indices[batch_idx, queue_idx] = MAXINT
 
 
 def dedup_tensor_(ids: Tensor, stream=None):
     (batch_size, queue_size) = ids.size()
-    assert queue_size < 1024
     assert ids.is_contiguous()
     assert ids.dtype == torch.int32
+
+    queue_size = min(queue_size, 1024)
 
     grid = (batch_size, 1, 1)
     block = (queue_size, 1, 1)
@@ -492,11 +513,12 @@ def dedup_tensor_pair_(ids: Tensor, distances: Tensor, stream=None):
     """Assumes sorted tensors!"""
     (batch_size, queue_size) = ids.size()
     (batch_size2, queue_size2) = distances.size()
-    assert queue_size < 1024
     assert batch_size == batch_size2
     assert queue_size == queue_size2
     assert ids.is_contiguous()
     assert distances.is_contiguous()
+
+    queue_size = min(queue_size, 1024)
 
     grid = (batch_size, 1, 1)
     block = (queue_size, 1, 1)
@@ -1107,7 +1129,7 @@ def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
 
 def generate_layered_ann(vectors: Tensor, config: Dict):
     """ """
-    neighborhood_size = config.neighborhood_size
+    neighborhood_size = config["neighborhood_size"]
     layers = []
     (count, _) = vectors.size()
     order = neighborhood_size * 3
@@ -1116,7 +1138,7 @@ def generate_layered_ann(vectors: Tensor, config: Dict):
         bound = min(size, count)
         (ann, _) = generate_ann(vectors[0:bound], config)
         layers.append(ann)
-        if size > count:
+        if size >= count:
             break
         else:
             size = order * size
@@ -1558,6 +1580,9 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
 
     build_params = {
+        "type": "layered" if args.layered else "cagra",
+        "vector_count": args.vector_count,
+        "vector_dimension": args.vector_dimension,
         "prune": args.prune,
         "neighborhood_size": args.neighborhood_size,
         "parallel_visit_count": args.parallel_visit_count,
@@ -1584,8 +1609,11 @@ if __name__ == "__main__":
 
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
 
-    build_params["commit"] = commit
+    os.makedirs("./log", exist_ok=True)
+    build_params["commit"] = commit.decode("utf-8").strip()
     build_params["recall"] = recall
-    log_name = f"experiment-{time.time()}.log"
+    build_params["closest_vectors_batch_time"] = CLOSEST_VECTORS_BATCH_TIME
+    log_name = f"./log/experiment-{time.time()}.log"
     with open(log_name, "w") as w:
+        print(build_params)
         json.dump(build_params, w)
