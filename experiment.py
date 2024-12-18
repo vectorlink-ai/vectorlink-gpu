@@ -137,9 +137,7 @@ class Queue:
         (batch_size, total_length) = vector_id_batch.size()
         (total_batch_size, _) = self.indices.size()
         difference = total_batch_size - batch_size
-        random_padding = generate_circulant_neighborhoods(
-            difference, primes(total_length)
-        )
+        random_padding = generate_circulant_beams(difference, primes(total_length))
         random_distances = calculate_distances(vectors, random_padding)
         ids = torch.vstack([vector_id_batch, random_padding])
         dist = torch.vstack([distances_batch, random_distances])
@@ -262,20 +260,20 @@ def cosine_distance_kernel(vec1, vec2, out):
     )
 )
 def cuda_search_from_seeds_kernel(
-    query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
+    query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out
 ):
     distance_buffer = numba.cuda.shared.array(4 * 1536, float32)
 
     batch_idx = cuda.blockIdx.x
     queue_idx = cuda.blockIdx.y
-    neighborhood_idx = cuda.blockIdx.z
+    beam_idx = cuda.blockIdx.z
 
     vector_idx = cuda.threadIdx.x
 
     batch_size = query_vecs.shape[0]
     vector_count = vectors.shape[0]
     vector_dim = query_vecs.shape[1]
-    neighborhood_size = neighborhoods.shape[1]
+    beam_size = beams.shape[1]
     queue_size = neighbors_to_visit.shape[1]
 
     if vector_idx >= vector_dim or queue_idx >= queue_size or batch_idx >= batch_size:
@@ -286,11 +284,11 @@ def cuda_search_from_seeds_kernel(
     node_id = neighbors_to_visit[batch_idx, queue_idx]
     if node_id == MAXINT:
         if vector_idx == 0:
-            output_idx = queue_idx * neighborhood_size + neighborhood_idx
+            output_idx = queue_idx * beam_size + beam_idx
             index_out[batch_idx, output_idx] = MAXINT
             distance_out[batch_idx, output_idx] = MAXFLOAT
     elif node_id < vector_count:
-        neighbor_vector_id = neighborhoods[node_id, neighborhood_idx]
+        neighbor_vector_id = beams[node_id, beam_idx]
         assert neighbor_vector_id < vector_count
         vector = vectors[neighbor_vector_id]
         query_vector = query_vecs[batch_idx]
@@ -298,7 +296,7 @@ def cuda_search_from_seeds_kernel(
             vector, query_vector, distance_buffer, vector_dim, vector_idx
         )
         if vector_idx == 0:
-            output_idx = queue_idx * neighborhood_size + neighborhood_idx
+            output_idx = queue_idx * beam_size + beam_idx
             index_out[batch_idx, output_idx] = neighbor_vector_id
             distance_out[batch_idx, output_idx] = result
     else:
@@ -312,20 +310,18 @@ def cuda_search_from_seeds_kernel(
         float32[:, ::1],
     )
 )
-def cuda_distances_kernel(
-    vectors: Tensor, neighborhoods: Tensor, distances_out: Tensor
-):
+def cuda_distances_kernel(vectors: Tensor, beams: Tensor, distances_out: Tensor):
     distance_buffer = numba.cuda.shared.array(4 * 1536, float32)
 
     vector_id = cuda.blockIdx.x
-    neighborhood_idx = cuda.blockIdx.y
+    beam_idx = cuda.blockIdx.y
     vector_group_idx = cuda.threadIdx.x
 
     vector_dimension = vectors.shape[1]
 
-    neighbor_id = neighborhoods[vector_id, neighborhood_idx]
+    neighbor_id = beams[vector_id, beam_idx]
     if neighbor_id == MAXINT:
-        distances_out[vector_id, neighborhood_idx] = MAXFLOAT
+        distances_out[vector_id, beam_idx] = MAXFLOAT
         return
 
     vector = vectors[vector_id]
@@ -340,46 +336,44 @@ def cuda_distances_kernel(
         print(
             "vector_id: ",
             vector_id,
-            "neighborhood_idx: ",
-            neighborhood_idx,
+            "beam_idx: ",
+            beam_idx,
             "neighbor_id: ",
             neighbor_id,
             "result: ",
             result,
         )
         """
-        distances_out[vector_id, neighborhood_idx] = result
+        distances_out[vector_id, beam_idx] = result
 
 
 @log_time
 def calculate_distances(
-    vectors: Tensor, neighborhoods: Tensor, stream=None, distances_out=None
+    vectors: Tensor, beams: Tensor, stream=None, distances_out=None
 ):
     assert vectors.dtype == torch.float32
     assert vectors.is_contiguous()
-    assert neighborhoods.dtype == torch.int32
-    assert neighborhoods.is_contiguous()
+    assert beams.dtype == torch.int32
+    assert beams.is_contiguous()
     if distances_out:
         assert distances_out.is_contiguous()
 
     (vector_count, vector_dimension) = vectors.size()
-    (batches, neighborhood_size) = neighborhoods.size()
+    (batches, beam_size) = beams.size()
 
     assert batches == vector_count
 
     vector_idx_group_size = min(vector_dimension, 1024)
     float_size = 4
 
-    grid = (vector_count, neighborhood_size, 1)
+    grid = (vector_count, beam_size, 1)
     block = (vector_idx_group_size, 1, 1)
 
     if not distances_out:
-        distances_out = torch.empty(
-            (vector_count, neighborhood_size), dtype=torch.float32
-        )
+        distances_out = torch.empty((vector_count, beam_size), dtype=torch.float32)
 
     cuda_distances_kernel[grid, block, stream, vector_dimension * float_size](
-        vectors, neighborhoods, distances_out
+        vectors, beams, distances_out
     )
 
     return distances_out
@@ -388,7 +382,7 @@ def calculate_distances(
 def cuda_search_from_seeds(
     query_vecs: Tensor,
     neighbors_to_visit: Tensor,
-    neighborhoods: Tensor,
+    beams: Tensor,
     vectors: Tensor,
 ) -> (Tensor, Tensor):
 
@@ -396,47 +390,47 @@ def cuda_search_from_seeds(
     assert query_vecs.is_contiguous()
     assert neighbors_to_visit.dtype == torch.int32
     assert neighbors_to_visit.is_contiguous()
-    assert neighborhoods.dtype == torch.int32
-    assert neighborhoods.is_contiguous()
+    assert beams.dtype == torch.int32
+    assert beams.is_contiguous()
     assert vectors.is_contiguous()
     assert vectors.dtype == torch.float32
 
     (batch_size, visit_length) = neighbors_to_visit.size()
-    (_, neighborhood_size) = neighborhoods.size()
+    (_, beam_size) = beams.size()
     (_, vector_dimension) = vectors.size()
     # TODO 1024 should probably be queried instead
     vector_idx_group_size = min(vector_dimension, 1024)
     float_size = 4
     # print(f"COUNT {COUNT}")
 
-    grid = (batch_size, visit_length, neighborhood_size)
+    grid = (batch_size, visit_length, beam_size)
     block = (vector_idx_group_size, 1, 1)
 
     # index_out = torch.empty(
-    #     (batch_size, visit_length * neighborhood_size), dtype=torch.int32, device=DEVICE
+    #     (batch_size, visit_length * beam_size), dtype=torch.int32, device=DEVICE
     # )
 
     index_out = torch.full(
-        (batch_size, visit_length * neighborhood_size),
+        (batch_size, visit_length * beam_size),
         MAXINT,
         dtype=torch.int32,
         device=DEVICE,
     )
 
     # distance_out = torch.empty(
-    #     (batch_size, visit_length * neighborhood_size),
+    #     (batch_size, visit_length * beam_size),
     #     dtype=torch.float32,
     #     device=DEVICE,
     # )
     distance_out = torch.full(
-        (batch_size, visit_length * neighborhood_size),
+        (batch_size, visit_length * beam_size),
         MAXFLOAT,
         dtype=torch.float32,
         device=DEVICE,
     )
 
     cuda_search_from_seeds_kernel[grid, block, None, vector_dimension * float_size](
-        query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
+        query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out
     )
     return (index_out, distance_out)
 
@@ -540,13 +534,11 @@ def comparison(qvs, nvs):
 def search_from_seeds(
     query_vecs: Tensor,
     neighbors_to_visit: Tensor,
-    neighborhoods: Tensor,
+    beams: Tensor,
     vectors: Tensor,
 ):
     with profiler.record_function("search_from_seeds"):
-        return cuda_search_from_seeds(
-            query_vecs, neighbors_to_visit, neighborhoods, vectors
-        )
+        return cuda_search_from_seeds(query_vecs, neighbors_to_visit, beams, vectors)
 
 
 @log_time
@@ -554,17 +546,17 @@ def closest_vectors(
     query_vecs: Tensor,
     search_queue: Queue,
     vectors: Tensor,
-    neighborhoods: Tensor,
+    beams: Tensor,
     config: Dict,
     exclude: Optional[Tensor] = None,
 ):
     with profiler.record_function("closest_vectors"):
         # print_timestamp("start of closest vectors")
         (_, vector_dimension) = vectors.size()
-        (neighborhood_count, neighborhood_size) = neighborhoods.size()
-        extra_capacity = neighborhood_size * config["parallel_visit_count"]
+        (beam_count, beam_size) = beams.size()
+        extra_capacity = beam_size * config["parallel_visit_count"]
         (batch_size, queue_capacity) = search_queue.size()
-        visit_queue_len = config["visit_queue_factor"] * config["neighborhood_size"]
+        visit_queue_len = config["visit_queue_factor"] * config["beam_size"]
         capacity = visit_queue_len + extra_capacity
         visit_queue = Queue(batch_size, visit_queue_len, capacity)
         visit_queue.initialize_from_queue(search_queue)
@@ -586,12 +578,12 @@ def closest_vectors(
                 seen = add_new_to_seen_(seen, neighbors_to_visit)
 
             (_, visit_length) = neighbors_to_visit.size()
-            narrow_to = batch_size * visit_length * neighborhood_size
+            narrow_to = batch_size * visit_length * beam_size
 
             (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
                 query_vecs,
                 neighbors_to_visit,
-                neighborhoods,
+                beams,
                 vectors,
             )
 
@@ -677,11 +669,11 @@ def index_by_tensor(a: Tensor, b: Tensor):
         return a
 
 
-def index_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
+def index_sort(beams: Tensor, beam_distances: Tensor):
     with profiler.record_function("index_sort"):
-        (ns, indices) = neighborhoods.sort(1)
+        (ns, indices) = beams.sort(1)
 
-        nds = index_by_tensor(neighborhood_distances, indices)
+        nds = index_by_tensor(beam_distances, indices)
 
         (nds, indices) = nds.sort(dim=1, stable=True)
 
@@ -690,9 +682,9 @@ def index_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
         return (ns, nds)
 
 
-def queue_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
+def queue_sort(beams: Tensor, beam_distances: Tensor):
     with profiler.record_function("queue_sort"):
-        (ns, nds) = index_sort(neighborhoods, neighborhood_distances)
+        (ns, nds) = index_sort(beams, beam_distances)
         return punch_out_duplicates_(ns, nds)
 
 
@@ -712,13 +704,13 @@ def example_db():
         device="cuda",
     )
 
-    neighborhoods = torch.tensor(
+    beams = torch.tensor(
         [[4, 6], [4, 5], [6, 7], [5, 7], [0, 1], [1, 3], [0, 2], [2, 3]],
         dtype=torch.int32,
         device="cuda",
     )
 
-    return (vs, neighborhoods)
+    return (vs, beams)
 
 
 def two_hop(ns: Tensor):
@@ -1119,7 +1111,7 @@ def primes(size: int):
     return PRIMES.narrow(0, 0, size)
 
 
-def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
+def generate_circulant_beams(num_vecs: int, primes: Tensor) -> Tensor:
     indices = torch.arange(num_vecs, device=DEVICE, dtype=torch.int32)
     (nhs,) = primes.size()
     repeated_indices = indices.expand(nhs, num_vecs).transpose(0, 1)
@@ -1130,10 +1122,10 @@ def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
 
 def generate_layered_ann(vectors: Tensor, config: Dict):
     """ """
-    neighborhood_size = config["neighborhood_size"]
+    beam_size = config["beam_size"]
     layers = []
     (count, _) = vectors.size()
-    order = neighborhood_size * 3
+    order = beam_size * 3
     size = 10_000
     while True:
         bound = min(size, count)
@@ -1150,25 +1142,25 @@ def generate_layered_ann(vectors: Tensor, config: Dict):
 def generate_hnsw(vectors: Tensor, config: Dict):
     """ """
     (vector_count, _) = vectors.size()
-    neighborhood_size = config["neighborhood_size"]
-    order = neighborhood_size * 3
+    beam_size = config["beam_size"]
+    order = beam_size * 3
     layer_size = order
     bound = min(layer_size, vector_count)
-    (ann, distances) = generate_ann(neighborhood_size, vectors[0:bound])
+    (ann, distances) = generate_ann(beam_size, vectors[0:bound])
 
     layers = [ann]
-    queue_length = neighborhood_size * config["neighborhood_queue_factor"]
+    queue_length = beam_size * config["beam_queue_factor"]
     remaining_capacity = queue_length * config["parallel_visit_count"]
 
     queue = Queue(
         bound,
         queue_length,
         queue_length + remaining_capacity,
-    )  # make que from neighborhoods + neigbhorhood_distances
+    )  # make que from beams + neigbhorhood_distances
     # print("neigbhorhoods")
-    # print(neighborhoods)
-    # print("neighborhood distances")
-    # print(neighborhood_distances)
+    # print(beams)
+    # print("beam distances")
+    # print(beam_distances)
 
     c = 0
     print(f"layer_size: {layer_size}, vector_count: {vector_count}")
@@ -1187,11 +1179,11 @@ def generate_hnsw(vectors: Tensor, config: Dict):
         qvs = vectors[:bound]
         search_layers(layers, qvs, queue, vectors)
 
-        ann = queue.indices.narrow_copy(1, 0, neighborhood_size)
+        ann = queue.indices.narrow_copy(1, 0, beam_size)
         print(ann)
         print(f"Isolated layer recall")
         ann_calculate_recall(vectors[:bound], ann)
-        distances = queue.distances.narrow_copy(1, 0, neighborhood_size)
+        distances = queue.distances.narrow_copy(1, 0, beam_size)
 
         layers.append(ann)
         c += 1
@@ -1202,16 +1194,16 @@ def generate_hnsw(vectors: Tensor, config: Dict):
 def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
     # print_timestamp("generating ann")
     (num_vecs, vec_dim) = vectors.size()
-    neighborhood_size = config["neighborhood_size"]
-    queue_length = neighborhood_size * config["neighborhood_queue_factor"]
+    beam_size = config["beam_size"]
+    queue_length = beam_size * config["beam_queue_factor"]
     neighbor_primes = primes(queue_length)
-    neighborhoods = generate_circulant_neighborhoods(num_vecs, neighbor_primes)
-    assert neighborhoods.dtype == torch.int32
-    # print_timestamp("circulant neighborhoods generated")
-    neighborhood_distances = calculate_distances(vectors, neighborhoods)
+    beams = generate_circulant_beams(num_vecs, neighbor_primes)
+    assert beams.dtype == torch.int32
+    # print_timestamp("circulant beams generated")
+    beam_distances = calculate_distances(vectors, beams)
 
     # print_timestamp("distances calculated")
-    # we want to be able to add a 'big' neighborhood at the end, which happens to be queue_length
+    # we want to be able to add a 'big' beam at the end, which happens to be queue_length
     remaining_capacity = queue_length * config["parallel_visit_count"]
 
     batch_size = config["batch_size"]
@@ -1220,8 +1212,8 @@ def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
 
     for i in range(0, config["cagra_loops"]):
         print_timestamp(f"start of cagra loop {i}")
-        next_neighborhoods = torch.empty_like(neighborhoods)
-        next_neighborhood_distances = torch.empty_like(neighborhood_distances)
+        next_beams = torch.empty_like(beams)
+        next_beam_distances = torch.empty_like(beam_distances)
         for batch_count in range(0, number_of_batches):
             print_timestamp(f"  start of batch loop {batch_count}")
             batch_start_idx = batch_count * batch_size
@@ -1235,50 +1227,44 @@ def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
                 queue_length,
                 queue_length + remaining_capacity,
             )
-            neighborhoods_slice = neighborhoods.narrow(0, batch_start_idx, batch)
-            neighborhood_distances_slice = neighborhood_distances.narrow(
-                0, batch_start_idx, batch
-            )
-            queue.insert(neighborhoods_slice, neighborhood_distances_slice)
+            beams_slice = beams.narrow(0, batch_start_idx, batch)
+            beam_distances_slice = beam_distances.narrow(0, batch_start_idx, batch)
+            queue.insert(beams_slice, beam_distances_slice)
 
             closest_vectors(
                 vectors[batch_start_idx:batch_end_idx],
                 queue,
                 vectors,
-                neighborhoods,
+                beams,
                 config,
                 exclude,
             )
 
-            next_neighborhoods_slice = next_neighborhoods.narrow(
-                0, batch_start_idx, batch
-            )
-            next_neighborhood_distance_slice = next_neighborhood_distances.narrow(
+            next_beams_slice = next_beams.narrow(0, batch_start_idx, batch)
+            next_beam_distance_slice = next_beam_distances.narrow(
                 0, batch_start_idx, batch
             )
             queue_indices = queue.indices.narrow(1, 0, queue_length)
             queue_distances = queue.distances.narrow(1, 0, queue_length)
-            next_neighborhoods_slice.copy_(queue_indices)
-            next_neighborhood_distance_slice.copy_(queue_distances)
+            next_beams_slice.copy_(queue_indices)
+            next_beam_distance_slice.copy_(queue_distances)
             remaining -= batch
 
         remaining = num_vecs
 
         ## We prune here!
         if config["prune"]:
-            (neighborhoods, distances) = prune_(
-                next_neighborhoods, next_neighborhood_distances
-            )
+            (beams, distances) = prune_(next_beams, next_beam_distances)
         else:
-            (neighborhoods, distances) = (
-                next_neighborhoods,
-                next_neighborhood_distances,
+            (beams, distances) = (
+                next_beams,
+                next_beam_distances,
             )
 
         prefix = min(vectors.size()[0], 1000)
         (found, recall) = ann_calculate_recall(
             vectors,
-            neighborhoods.narrow_copy(1, 0, neighborhood_size),
+            beams.narrow_copy(1, 0, beam_size),
             config,
             sample=vectors[:prefix],
         )
@@ -1287,8 +1273,8 @@ def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
             break
         print_timestamp(f"end of cagra loop {i}")
     return (
-        neighborhoods.narrow_copy(1, 0, neighborhood_size),
-        neighborhood_distances.narrow_copy(1, 0, neighborhood_size),
+        beams.narrow_copy(1, 0, beam_size),
+        beam_distances.narrow_copy(1, 0, beam_size),
     )
 
 
@@ -1318,14 +1304,14 @@ def punchout_excluded_(indices, distances, exclusions, stream=None):
 
 
 def initial_queue(vectors: Tensor, config: Dict):
-    queue_size = config["recall_search_queue_factor"] * config["neighborhood_size"]
+    queue_size = config["recall_search_queue_factor"] * config["beam_size"]
     (batch_size, _) = vectors.size()
     extra_capacity = max(
-        queue_size, config["parallel_visit_count"] * config["neighborhood_size"]
+        queue_size, config["parallel_visit_count"] * config["beam_size"]
     )
     queue = Queue(batch_size, queue_size, queue_size + extra_capacity)
     p = primes(queue_size)
-    initial_queue_indices = generate_circulant_neighborhoods(batch_size, p)
+    initial_queue_indices = generate_circulant_beams(batch_size, p)
     d = calculate_distances(vectors, initial_queue_indices)
     queue.insert(initial_queue_indices, d)
 
@@ -1334,19 +1320,19 @@ def initial_queue(vectors: Tensor, config: Dict):
 
 def ann_calculate_recall(
     vectors: Tensor,
-    neighborhoods: Tensor,
+    beams: Tensor,
     config: Dict,
     sample: Optional[Tensor] = None,
 ):
     if sample is None:
         sample = vectors
     (sample_size, _) = sample.size()
-    (_, neighborhood_size) = neighborhoods.size()
+    (_, beam_size) = beams.size()
 
     queue = initial_queue(sample, config)
     # print_timestamp("queues allocated")
 
-    closest_vectors(sample, queue, vectors, neighborhoods, config)
+    closest_vectors(sample, queue, vectors, beams, config)
     # print_timestamp("closest vectors calculated")
     expected = torch.arange(sample_size)
     actual = queue.indices.t()[0]
@@ -1366,7 +1352,7 @@ def hnsw_calculate_recall(
         sample = vectors
     (sample_size, _) = sample.size()
 
-    (_, neighborhood_size) = hnsw[-1].size()
+    (_, beam_size) = hnsw[-1].size()
 
     queue = initial_queue(sample, config)
     # print_timestamp("queues allocated")
@@ -1386,11 +1372,11 @@ def hnsw_calculate_recall(
 
 def ann_recall_test(vectors: Tensor, config: Dict):
     # print_timestamp("vectors allocated")
-    (neighborhoods, _) = generate_ann(vectors, config)
+    (beams, _) = generate_ann(vectors, config)
     print_timestamp("=> ANN generated")
 
     prefix = min(vectors.size()[0], 1000)
-    return ann_calculate_recall(vectors, neighborhoods, config, sample=vectors[:prefix])
+    return ann_calculate_recall(vectors, beams, config, sample=vectors[:prefix])
 
 
 def layered_ann_recall_test(vectors: Tensor, config):
@@ -1517,7 +1503,7 @@ def grid_search():
         "vector_dimension": 1536,
         "exclude_factor": 5,
         "batch_size": 10_000,
-        "neighborhood_queue_factor": 3,
+        "beam_queue_factor": 3,
         "recall_search_queue_factor": 6,
     }
     vectors = generate_random_vectors(
@@ -1526,12 +1512,12 @@ def grid_search():
 
     os.makedirs("./grid-log", exist_ok=True)
     for prune in [True, False]:
-        for neighborhood_size in [24, 32, 46]:
+        for beam_size in [24, 32, 46]:
             for parallel_visit_count in [1, 4]:
                 for cagra_loops in [1, 2]:
                     for visit_queue_factor in [3, 4]:
                         config["prune"] = prune
-                        config["neighborhood_size"] = neighborhood_size
+                        config["beam_size"] = beam_size
                         config["parallel_visit_count"] = parallel_visit_count
                         config["visit_queue_factor"] = visit_queue_factor
                         config["cagra_loops"] = cagra_loops
@@ -1584,8 +1570,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-n",
-        "--neighborhood_size",
-        help="beam or neighborhood size",
+        "--beam_size",
+        help="beam size (max number of neighbors)",
         type=int,
         default=24,
     )
@@ -1600,21 +1586,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "-q",
         "--visit_queue_factor",
-        help="factor larger than neighborhood for visit queue",
+        help="factor larger than beam for visit queue",
         type=int,
         default=3,
     )
     parser.add_argument(
         "-f",
-        "--neighborhood_queue_factor",
-        help="factor larger than neighborhood for initial beams",
+        "--beam_queue_factor",
+        help="factor larger than beam for initial beams",
         type=int,
         default=3,
     )
     parser.add_argument(
         "-b",
         "--batch_size",
-        help="how many vectors/neighborhoods to run per batch",
+        help="how many vectors/beams to run per batch",
         type=int,
         default=10_000,
     )
@@ -1642,9 +1628,9 @@ if __name__ == "__main__":
         "vector_count": args.vector_count,
         "vector_dimension": args.vector_dimension,
         "prune": args.prune,
-        "neighborhood_size": args.neighborhood_size,
+        "beam_size": args.beam_size,
         "parallel_visit_count": args.parallel_visit_count,
-        "neighborhood_queue_factor": args.neighborhood_queue_factor,
+        "beam_queue_factor": args.beam_queue_factor,
         "visit_queue_factor": args.visit_queue_factor,
         "exclude_factor": args.exclude_factor,
         "cagra_loops": args.cagra_loops,
