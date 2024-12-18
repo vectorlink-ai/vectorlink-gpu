@@ -1517,7 +1517,6 @@ def grid_search():
         "vector_dimension": 1536,
         "exclude_factor": 5,
         "batch_size": 10_000,
-        "neigbhorhood_size": 32,
         "neighborhood_queue_factor": 3,
         "recall_search_queue_factor": 6,
     }
@@ -1553,13 +1552,14 @@ def main(vectors, configuration):
         print("CAGRA ANN >>>>>")
         (_, recall) = ann_recall_test(vectors, configuration)
         print("<<<<< FINISHED CAGRA")
-
     end = time.time()
-    configuration["construction_time"] = end - start
-    commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
 
-    configuration["commit"] = commit.decode("utf-8").strip()
+    configuration["construction_time"] = end - start
     configuration["recall"] = recall
+    commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
+    configuration["commit"] = commit.decode("utf-8").strip()
+    gpu_arch = subprocess.check_output(["nvidia-smi", "-L"])
+    configuration["gpu_arch"] = gpu_arch.decode("utf-8").strip()
     configuration["closest_vectors_batch_time"] = CLOSEST_VECTORS_BATCH_TIME
 
     return configuration
