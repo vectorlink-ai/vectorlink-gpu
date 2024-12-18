@@ -166,13 +166,23 @@ class Queue:
         return self.indices.size()
 
 
-@cuda.jit(void(float32[::1], int64, int64, int64), device=True)
+@cuda.jit(void(float32[::1], int64, int64, int64), device=True, inline=True)
 def sum_part(vec, dim, scale, idx):
     if idx + scale < dim and idx < scale:
         vec[idx] += vec[idx + scale]
 
 
-@cuda.jit(float32(float32[::1], int64, int64), device=True)
+@cuda.jit(void(float32[::1], int64))
+def warp_reduce(vec, thread_idx):
+    vec[thread_idx] += vec[thread_idx + 32]
+    vec[thread_idx] += vec[thread_idx + 16]
+    vec[thread_idx] += vec[thread_idx + 8]
+    vec[thread_idx] += vec[thread_idx + 4]
+    vec[thread_idx] += vec[thread_idx + 2]
+    vec[thread_idx] += vec[thread_idx + 1]
+
+
+@cuda.jit(float32(float32[::1], int64, int64), device=True, inline=True)
 def sum(vec, dim, idx):
     scale = dim
     while scale > 32:
@@ -183,7 +193,7 @@ def sum(vec, dim, idx):
     if idx == 0:
         for i in range(0, scale):
             result += vec[i]
-    return result
+    return result[0]
 
 
 @cuda.jit(void(float32[::1], float32[::1]))
@@ -196,11 +206,15 @@ def sum_kernel(vec, out):
         out[0] = result
 
 
-@cuda.jit(float32(float32[::1], float32[::1], float32[::1], int64, int64), device=True)
+@cuda.jit(
+    float32(float32[::1], float32[::1], float32[::1], int64, int64),
+    device=True,
+    inline=True,
+)
 def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
     groups = int((vector_dimension + 1023) / 1024)
-    for group_index in range(0, groups):
-        inner_idx = idx + group_index * 1024
+    for group_offset in range(0, groups):
+        inner_idx = idx * groups + group_offset
         if inner_idx >= vector_dimension:
             break
 
@@ -262,7 +276,7 @@ def cosine_distance_kernel(vec1, vec2, out):
 def cuda_search_from_seeds_kernel(
     query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out
 ):
-    distance_buffer = numba.cuda.shared.array(4 * 1536, float32)
+    shared = numba.cuda.shared.array(0, float32)
 
     batch_idx = cuda.blockIdx.x
     queue_idx = cuda.blockIdx.y
@@ -275,6 +289,8 @@ def cuda_search_from_seeds_kernel(
     vector_dim = query_vecs.shape[1]
     beam_size = beams.shape[1]
     queue_size = neighbors_to_visit.shape[1]
+
+    distance_buffer = shared[0:vector_dim]
 
     if vector_idx >= vector_dim or queue_idx >= queue_size or batch_idx >= batch_size:
         return
@@ -399,7 +415,10 @@ def cuda_search_from_seeds(
     (_, beam_size) = beams.size()
     (_, vector_dimension) = vectors.size()
     # TODO 1024 should probably be queried instead
-    vector_idx_group_size = min(vector_dimension, 1024)
+    number_of_groups = int((vector_dimension + 1023) / 1024)
+    vector_idx_group_size = int(
+        (vector_dimension + number_of_groups - 1) / number_of_groups
+    )
     float_size = 4
     # print(f"COUNT {COUNT}")
 
