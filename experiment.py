@@ -14,7 +14,8 @@ import json
 
 import numba
 from numba import cuda, gdb_init, void, float32, int64, int32
-from cuda import Stream
+
+from torch.cuda import Stream
 
 # This gives more headroom, but is harder to read
 MAXINT = 2147483647  # 2**31-1
@@ -79,28 +80,26 @@ class Queue:
         vector_id_batch: Tensor,
         distances_batch: Tensor,
         exclude: Optional[Tensor] = None,  # formatted like [[0,MAXINT...],[1],[2]]
-        stream: Optional[Stream] = None,
     ):
-        if stream is not None:
-            self.indices.record_stream(stream)
-            self.distances.record_stream(stream)
-            vector_id_batch.record_stream(stream)
-            distances.record_stream(stream)
-            exclude.record_stream(stream)
+        self.indices.record_stream(torch.cuda.current_stream())
+        self.distances.record_stream(torch.cuda.current_stream())
+        vector_id_batch.record_stream(torch.cuda.current_stream())
+        distances_batch.record_stream(torch.cuda.current_stream())
+        if exclude is not None:
+            exclude.record_stream(torch.cuda.current_stream())
 
-        with torch.cuda.stream(stream):
-            self.buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
-            (batches, size_per_batch) = vector_id_batch.size()
-            indices_tail = self.indices.narrow(1, self.length, size_per_batch)
-            distances_tail = self.distances.narrow(1, self.length, size_per_batch)
-            indices_tail.copy_(vector_id_batch)
-            distances_tail.copy_(distances_batch)
+        self.buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
+        (batches, size_per_batch) = vector_id_batch.size()
+        indices_tail = self.indices.narrow(1, self.length, size_per_batch)
+        distances_tail = self.distances.narrow(1, self.length, size_per_batch)
+        indices_tail.copy_(vector_id_batch)
+        distances_tail.copy_(distances_batch)
 
-            if exclude is not None:
-                punchout_excluded_(indices_tail, distances_tail, exclude)
+        if exclude is not None:
+            punchout_excluded_(indices_tail, distances_tail, exclude)
 
-            (self.indices, self.distances) = queue_sort(self.indices, self.distances)
-            did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
+        (self.indices, self.distances) = queue_sort(self.indices, self.distances)
+        did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
         return did_something_mask
 
     def insert_random_padded(
@@ -366,9 +365,7 @@ def cuda_distances_kernel(vectors: Tensor, beams: Tensor, distances_out: Tensor)
 
 
 @log_time
-def calculate_distances(
-    vectors: Tensor, beams: Tensor, stream: Optional[Stream] = None, distances_out=None
-):
+def calculate_distances(vectors: Tensor, beams: Tensor, distances_out=None):
     assert vectors.dtype == torch.float32
     assert vectors.is_contiguous()
     assert beams.dtype == torch.int32
@@ -390,9 +387,9 @@ def calculate_distances(
     if not distances_out:
         distances_out = torch.empty((vector_count, beam_size), dtype=torch.float32)
 
-    cuda_distances_kernel[grid, block, stream, vector_dimension * float_size](
-        vectors, beams, distances_out
-    )
+    cuda_distances_kernel[
+        grid, block, numba_current_stream(), vector_dimension * float_size
+    ](vectors, beams, distances_out)
 
     return distances_out
 
@@ -402,7 +399,6 @@ def cuda_search_from_seeds(
     neighbors_to_visit: Tensor,
     beams: Tensor,
     vectors: Tensor,
-    stream: Optional[Stream] = None,
 ) -> (Tensor, Tensor):
 
     assert query_vecs.dtype == torch.float32
@@ -451,9 +447,12 @@ def cuda_search_from_seeds(
         device=DEVICE,
     )
 
-    cuda_search_from_seeds_kernel[grid, block, stream, vector_dimension * float_size](
-        query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out
-    )
+    cuda_search_from_seeds_kernel[
+        grid,
+        block,
+        numba_current_stream(),
+        vector_dimension * float_size,
+    ](query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out)
     return (index_out, distance_out)
 
 
@@ -513,7 +512,7 @@ def punchout_kernel(indices: Tensor):
                 indices[batch_idx, queue_idx] = MAXINT
 
 
-def dedup_tensor_(ids: Tensor, stream=None):
+def dedup_tensor_(ids: Tensor):
     (batch_size, queue_size) = ids.size()
     assert ids.is_contiguous()
     assert ids.dtype == torch.int32
@@ -522,11 +521,11 @@ def dedup_tensor_(ids: Tensor, stream=None):
 
     grid = (batch_size, 1, 1)
     block = (queue_size, 1, 1)
-    mark_kernel[grid, block, stream, 0](ids)
-    punchout_kernel[grid, block, stream, 0](ids)
+    mark_kernel[grid, block, numba_current_stream(), 0](ids)
+    punchout_kernel[grid, block, numba_current_stream(), 0](ids)
 
 
-def dedup_tensor_pair_(ids: Tensor, distances: Tensor, stream=None):
+def dedup_tensor_pair_(ids: Tensor, distances: Tensor):
     """Assumes sorted tensors!"""
     (batch_size, queue_size) = ids.size()
     (batch_size2, queue_size2) = distances.size()
@@ -539,8 +538,8 @@ def dedup_tensor_pair_(ids: Tensor, distances: Tensor, stream=None):
 
     grid = (batch_size, 1, 1)
     block = (queue_size, 1, 1)
-    mark_kernel[grid, block, stream, 0](ids)
-    punchout_pair_kernel[grid, block, stream, 0](ids, distances)
+    mark_kernel[grid, block, numba_current_stream(), 0](ids)
+    punchout_pair_kernel[grid, block, numba_current_stream(), 0](ids, distances)
 
 
 def comparison(qvs, nvs):
@@ -558,12 +557,9 @@ def search_from_seeds(
     neighbors_to_visit: Tensor,
     beams: Tensor,
     vectors: Tensor,
-    stream: Optional[Stream] = None,
 ):
     with profiler.record_function("search_from_seeds"):
-        return cuda_search_from_seeds(
-            query_vecs, neighbors_to_visit, beams, vectors, stream
-        )
+        return cuda_search_from_seeds(query_vecs, neighbors_to_visit, beams, vectors)
 
 
 @log_time
@@ -594,36 +590,44 @@ def closest_vectors(
             dtype=torch.int32,
         )
 
-        s1 = allocate_stream()
-        s2 = allocate_stream()
+        s1 = Stream()
+        s2 = Stream()
         while torch.any(did_something):
             # print_timestamp("start of loop")
+            with torch.cuda.stream(torch.cuda.current_stream()):
+                # with torch.cuda.stream(s1):
+                torch.cuda.default_stream().wait_stream(s1)
 
-            neighbors_to_visit = visit_queue.pop_n_ids(config["parallel_visit_count"])
+                neighbors_to_visit = visit_queue.pop_n_ids(
+                    config["parallel_visit_count"]
+                )
 
-            if seen is not None:
-                seen = add_new_to_seen_(seen, neighbors_to_visit)
+                if seen is not None:
+                    seen = add_new_to_seen_(seen, neighbors_to_visit)
 
-            (_, visit_length) = neighbors_to_visit.size()
-            narrow_to = batch_size * visit_length * beam_size
+                (_, visit_length) = neighbors_to_visit.size()
+                narrow_to = batch_size * visit_length * beam_size
 
-            (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
-                query_vecs, neighbors_to_visit, beams, vectors, s1
-            )
-            s2.wait_stream(s1)
-            did_something = search_queue.insert(
-                indexes_of_comparisons,
-                distances_of_comparisons,
-                exclude=exclude,
-                stream=s2,
-            )
-            if seen is not None:
-                visit_queue.insert(
+                (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
+                    query_vecs, neighbors_to_visit, beams, vectors
+                )
+
+                # s2.wait_stream(s1)
+                did_something = search_queue.insert(
                     indexes_of_comparisons,
                     distances_of_comparisons,
-                    exclude=seen,
-                    stream=s1,
+                    exclude=exclude,
                 )
+                did_something.record_stream(torch.cuda.default_stream())
+                if seen is not None:
+                    visit_queue.insert(
+                        indexes_of_comparisons,
+                        distances_of_comparisons,
+                        exclude=seen,
+                    )
+
+        torch.cuda.default_stream().wait_stream(s1)
+        # torch.cuda.default_stream().wait_stream(s2)
 
     return True
 
@@ -1324,13 +1328,28 @@ def punchout_excluded_kernel(indices: Tensor, distances: Tensor, exclusions: Ten
             distances[batch_idx, queue_idx] = MAXFLOAT
 
 
-def punchout_excluded_(indices, distances, exclusions, stream=None):
+def punchout_excluded_(indices, distances, exclusions):
     (batch_size, queue_size) = indices.size()
     (batch_size2, exclusion_size) = exclusions.size()
     assert batch_size == batch_size2
     grid = (batch_size, 1, 1)
     block = (queue_size, 1, 1)
-    punchout_excluded_kernel[grid, block, stream, 0](indices, distances, exclusions)
+    punchout_excluded_kernel[grid, block, numba_current_stream(), 0](
+        indices, distances, exclusions
+    )
+
+
+def numba_current_stream():
+    torch_current_stream = torch.cuda.current_stream()
+    return numba.cuda.external_stream(torch_current_stream.cuda_stream)
+
+
+def stream_to_numba(stream: Optional[Stream]):
+    numba_stream = None
+    if stream is not None:
+        numba_stream = numba.cuda.external_stream(stream.cuda_stream)
+
+    return numba_stream
 
 
 def initial_queue(vectors: Tensor, config: Dict):
@@ -1517,7 +1536,7 @@ def prune_(beams, distances):
     (batch_size, beam_size) = beams.size()
     grid = (batch_size, beam_size, 1)
     block = (beam_size, 1, 1)
-    prune_kernel[grid, block, None, 0](beams, distances)
+    prune_kernel[grid, block, numba_current_stream(), 0](beams, distances)
 
     (distances, permutation) = distances.sort()
     beams = index_by_tensor(beams, permutation)
