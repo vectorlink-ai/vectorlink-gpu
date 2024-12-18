@@ -168,32 +168,56 @@ class Queue:
 
 @cuda.jit(void(float32[::1], int64, int64, int64), device=True, inline=True)
 def sum_part(vec, dim, scale, idx):
-    if idx + scale < dim and idx < scale:
+    if idx < scale:
         vec[idx] += vec[idx + scale]
 
 
-@cuda.jit(void(float32[::1], int64))
+@cuda.jit(void(float32[::1], int64), device=True, inline=True)
 def warp_reduce(vec, thread_idx):
-    vec[thread_idx] += vec[thread_idx + 32]
-    vec[thread_idx] += vec[thread_idx + 16]
-    vec[thread_idx] += vec[thread_idx + 8]
-    vec[thread_idx] += vec[thread_idx + 4]
-    vec[thread_idx] += vec[thread_idx + 2]
-    vec[thread_idx] += vec[thread_idx + 1]
+    if thread_idx < 32:
+        vec[thread_idx] += vec[thread_idx + 32]
+        vec[thread_idx] += vec[thread_idx + 16]
+        vec[thread_idx] += vec[thread_idx + 8]
+        vec[thread_idx] += vec[thread_idx + 4]
+        vec[thread_idx] += vec[thread_idx + 2]
+        vec[thread_idx] += vec[thread_idx + 1]
 
 
 @cuda.jit(float32(float32[::1], int64, int64), device=True, inline=True)
 def sum(vec, dim, idx):
-    scale = dim
-    while scale > 32:
-        scale /= 2
-        sum_part(vec, dim, scale, idx)
+    # assert dim > 1024
+
+    groups = int((dim + 1023) / 1024)
+    for group in range(1, groups):
+        inner_idx = 1024 * group + idx
+        if inner_idx >= dim:
+            break
+        vec[idx] += vec[inner_idx]
     numba.cuda.syncthreads()
-    result = 0.0
-    if idx == 0:
-        for i in range(0, scale):
-            result += vec[i]
-    return result
+
+    if idx < 512:
+        vec[idx] += vec[idx + 512]
+    else:
+        return 0.0
+    numba.cuda.syncthreads()
+    if idx < 256:
+        vec[idx] += vec[idx + 256]
+    else:
+        return 0.0
+    numba.cuda.syncthreads()
+    if idx < 128:
+        vec[idx] += vec[idx + 128]
+    else:
+        return 0.0
+    numba.cuda.syncthreads()
+    if idx < 64:
+        vec[idx] += vec[idx + 64]
+    else:
+        return 0.0
+    numba.cuda.syncthreads()
+
+    warp_reduce(vec, idx)
+    return vec[0]
 
 
 @cuda.jit(void(float32[::1], float32[::1]))
@@ -220,6 +244,9 @@ def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
 
         buf[inner_idx] = vec1[inner_idx] * vec2[inner_idx]
 
+    numba.cuda.syncthreads()
+    if groups > 1:
+        buf[idx] = buf[idx]
     numba.cuda.syncthreads()
     # TODO sum will only work for vectors up to dim 2048 the way things are written now
     cos_theta = sum(buf, vector_dimension, idx)
