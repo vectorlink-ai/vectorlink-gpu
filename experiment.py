@@ -193,7 +193,7 @@ def sum(vec, dim, idx):
     if idx == 0:
         for i in range(0, scale):
             result += vec[i]
-    return result[0]
+    return result
 
 
 @cuda.jit(void(float32[::1], float32[::1]))
