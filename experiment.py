@@ -14,46 +14,12 @@ import json
 
 import numba
 from numba import cuda, gdb_init, void, float32, int64, int32
+from cuda import Stream
 
 # This gives more headroom, but is harder to read
 MAXINT = 2147483647  # 2**31-1
 MAXFLOAT = 3.4028e37
 DEVICE = "cuda"
-
-
-class FakeStream:
-    def __init__(self):
-        pass
-
-    def __enter__(self):
-        pass
-
-    def __exit__(self, exception_type, exception_value, traceback):
-        pass
-
-
-def allocate_stream():
-    if False and torch.cuda.is_available():
-        return torch.cuda.Stream()
-    else:
-        return FakeStream()
-
-
-def current_stream(s):
-    if False and torch.cuda.is_available():
-        return torch.cuda.stream(s)
-    else:
-        return FakeStream()
-
-
-def wait_stream(s1, s2):
-    if False and torch.cuda.is_available():
-        s1.stream_wait(s2)
-
-
-def record_stream(A, s):
-    if False and torch.cuda.is_available():
-        A.record_stream(s)
 
 
 def timed(fn):
@@ -113,19 +79,28 @@ class Queue:
         vector_id_batch: Tensor,
         distances_batch: Tensor,
         exclude: Optional[Tensor] = None,  # formatted like [[0,MAXINT...],[1],[2]]
+        stream: Optional[Stream] = None,
     ):
-        self.buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
-        (batches, size_per_batch) = vector_id_batch.size()
-        indices_tail = self.indices.narrow(1, self.length, size_per_batch)
-        distances_tail = self.distances.narrow(1, self.length, size_per_batch)
-        indices_tail.copy_(vector_id_batch)
-        distances_tail.copy_(distances_batch)
+        if stream is not None:
+            self.indices.record_stream(stream)
+            self.distances.record_stream(stream)
+            vector_id_batch.record_stream(stream)
+            distances.record_stream(stream)
+            exclude.record_stream(stream)
 
-        if exclude is not None:
-            punchout_excluded_(indices_tail, distances_tail, exclude)
+        with torch.cuda.stream(stream):
+            self.buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
+            (batches, size_per_batch) = vector_id_batch.size()
+            indices_tail = self.indices.narrow(1, self.length, size_per_batch)
+            distances_tail = self.distances.narrow(1, self.length, size_per_batch)
+            indices_tail.copy_(vector_id_batch)
+            distances_tail.copy_(distances_batch)
 
-        (self.indices, self.distances) = queue_sort(self.indices, self.distances)
-        did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
+            if exclude is not None:
+                punchout_excluded_(indices_tail, distances_tail, exclude)
+
+            (self.indices, self.distances) = queue_sort(self.indices, self.distances)
+            did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
         return did_something_mask
 
     def insert_random_padded(
@@ -392,7 +367,7 @@ def cuda_distances_kernel(vectors: Tensor, beams: Tensor, distances_out: Tensor)
 
 @log_time
 def calculate_distances(
-    vectors: Tensor, beams: Tensor, stream=None, distances_out=None
+    vectors: Tensor, beams: Tensor, stream: Optional[Stream] = None, distances_out=None
 ):
     assert vectors.dtype == torch.float32
     assert vectors.is_contiguous()
@@ -427,6 +402,7 @@ def cuda_search_from_seeds(
     neighbors_to_visit: Tensor,
     beams: Tensor,
     vectors: Tensor,
+    stream: Optional[Stream] = None,
 ) -> (Tensor, Tensor):
 
     assert query_vecs.dtype == torch.float32
@@ -475,7 +451,7 @@ def cuda_search_from_seeds(
         device=DEVICE,
     )
 
-    cuda_search_from_seeds_kernel[grid, block, None, vector_dimension * float_size](
+    cuda_search_from_seeds_kernel[grid, block, stream, vector_dimension * float_size](
         query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out
     )
     return (index_out, distance_out)
@@ -582,9 +558,12 @@ def search_from_seeds(
     neighbors_to_visit: Tensor,
     beams: Tensor,
     vectors: Tensor,
+    stream: Optional[Stream] = None,
 ):
     with profiler.record_function("search_from_seeds"):
-        return cuda_search_from_seeds(query_vecs, neighbors_to_visit, beams, vectors)
+        return cuda_search_from_seeds(
+            query_vecs, neighbors_to_visit, beams, vectors, stream
+        )
 
 
 @log_time
@@ -615,6 +594,8 @@ def closest_vectors(
             dtype=torch.int32,
         )
 
+        s1 = allocate_stream()
+        s2 = allocate_stream()
         while torch.any(did_something):
             # print_timestamp("start of loop")
 
@@ -627,18 +608,21 @@ def closest_vectors(
             narrow_to = batch_size * visit_length * beam_size
 
             (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
-                query_vecs,
-                neighbors_to_visit,
-                beams,
-                vectors,
+                query_vecs, neighbors_to_visit, beams, vectors, s1
             )
-
+            s2.wait_stream(s1)
             did_something = search_queue.insert(
-                indexes_of_comparisons, distances_of_comparisons, exclude=exclude
+                indexes_of_comparisons,
+                distances_of_comparisons,
+                exclude=exclude,
+                stream=s2,
             )
             if seen is not None:
                 visit_queue.insert(
-                    indexes_of_comparisons, distances_of_comparisons, exclude=seen
+                    indexes_of_comparisons,
+                    distances_of_comparisons,
+                    exclude=seen,
+                    stream=s1,
                 )
 
     return True
