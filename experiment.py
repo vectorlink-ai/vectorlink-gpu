@@ -592,41 +592,54 @@ def closest_vectors(
 
         s1 = Stream()
         s2 = Stream()
+        # seen.record_stream(s2)
         while torch.any(did_something):
             # print_timestamp("start of loop")
-            with torch.cuda.stream(torch.cuda.current_stream()):
-                # with torch.cuda.stream(s1):
-                torch.cuda.default_stream().wait_stream(s1)
+            # with torch.cuda.stream(torch.cuda.current_stream()):
+            s1.wait_stream(s2)
+            with torch.cuda.stream(s1):
 
                 neighbors_to_visit = visit_queue.pop_n_ids(
                     config["parallel_visit_count"]
                 )
+                neighbors_to_visit.record_stream(s1)
 
+                # s2.wait_stream(s1)
+                # with torch.cuda.stream(s2):
                 if seen is not None:
                     seen = add_new_to_seen_(seen, neighbors_to_visit)
 
+                if seen is not None:
+                    seen.record_stream(s2)
+
+            with torch.cuda.stream(s1):
                 (_, visit_length) = neighbors_to_visit.size()
                 narrow_to = batch_size * visit_length * beam_size
 
                 (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
                     query_vecs, neighbors_to_visit, beams, vectors
                 )
+                indexes_of_comparisons.record_stream(s1)
+                distances_of_comparisons.record_stream(s1)
 
-                # s2.wait_stream(s1)
+            s2.wait_stream(s1)
+            with torch.cuda.stream(s1):
                 did_something = search_queue.insert(
                     indexes_of_comparisons,
                     distances_of_comparisons,
                     exclude=exclude,
                 )
-                did_something.record_stream(torch.cuda.default_stream())
+                did_something.record_stream(s1)
+
+            with torch.cuda.stream(s2):
                 if seen is not None:
                     visit_queue.insert(
                         indexes_of_comparisons,
                         distances_of_comparisons,
                         exclude=seen,
                     )
-
-        torch.cuda.default_stream().wait_stream(s1)
+        torch.cuda.synchronize()
+        # torch.cuda.default_stream().wait_stream(s1)
         # torch.cuda.default_stream().wait_stream(s2)
 
     return True
@@ -1424,7 +1437,7 @@ def ann_recall_test(vectors: Tensor, config: Dict):
     (beams, _) = generate_ann(vectors, config)
     print_timestamp("=> ANN generated")
 
-    prefix = min(vectors.size()[0], 1000)
+    prefix = min(vectors.size()[0], 10_000)
     return ann_calculate_recall(vectors, beams, config, sample=vectors[:prefix])
 
 
@@ -1606,7 +1619,7 @@ if __name__ == "__main__":
         "-c", "--vector-count", help="number of vectors", type=int, default=10_000
     )
     parser.add_argument(
-        "-d", "--vector-dimension", help="dimension of vectors", type=int, default=1024
+        "-d", "--vector-dimension", help="dimension of vectors", type=int, default=1536
     )
     parser.add_argument(
         "-L", "--layered", help="use layered cagra", default=False, action="store_true"
