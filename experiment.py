@@ -604,16 +604,13 @@ def closest_vectors(
 
         visit_queue_stream = Stream()
         search_queue_stream = Stream()
-        # seen.record_stream(s2)
         visit_queue_stream.wait_stream(torch.cuda.default_stream())
         progressing = True
         count = 0
         while progressing:
-            # print_timestamp("start of loop")
-            # with torch.cuda.stream(torch.cuda.current_stream()):
-            # s1.wait_stream(s2)
+            count += 1
+            checking_output = (count % config["speculative_readahead"]) == 0
             with torch.cuda.stream(visit_queue_stream):
-
                 neighbors_to_visit = visit_queue.pop_n_ids(
                     config["parallel_visit_count"]
                 )
@@ -628,7 +625,7 @@ def closest_vectors(
                     indexes_of_comparisons,
                     distances_of_comparisons,
                     exclude=exclude,
-                    output_update=True,
+                    output_update=checking_output,
                 )
 
             with torch.cuda.stream(visit_queue_stream):
@@ -640,8 +637,7 @@ def closest_vectors(
                         indexes_of_comparisons, distances_of_comparisons, exclude=seen
                     )
 
-            count += 1
-            if (count % config["speculative_readahead"]) == 0:
+            if checking_output:
                 with torch.cuda.stream(search_queue_stream):
                     progressing = bool(torch.any(did_something))
 
