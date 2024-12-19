@@ -217,7 +217,7 @@ def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
     if groups > 1:
         buf[idx] = buf[idx]
     numba.cuda.syncthreads()
-    # TODO sum will only work for vectors up to dim 2048 the way things are written now
+    # TODO sum will only work on vectors with dim >= 1024
     cos_theta = sum(buf, vector_dimension, idx)
     numba.cuda.syncthreads()
     result = 1234.0
