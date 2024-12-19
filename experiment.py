@@ -930,26 +930,32 @@ def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
 
 @cuda.jit(void(int32[:, :], float32[:, :], int32[:, :]))
 def punchout_excluded_kernel(indices: Tensor, distances: Tensor, exclusions: Tensor):
+    queue_size = indices.shape[1]
     exclusions_length = exclusions.shape[1]
     batch_idx = cuda.blockIdx.x
-    queue_idx = cuda.threadIdx.x
+    queue_groups = int((queue_size + 1023) / 1024)
+    queue_group_idx = cuda.threadIdx.x
+    for group in range(0, queue_groups):
+        queue_idx = queue_group_idx * queue_groups + group
 
-    value = indices[batch_idx, queue_idx]
-    for i in range(0, exclusions_length):
-        exclude = exclusions[batch_idx, i]
-        if exclude == MAXINT:
-            break
-        if value == exclude:
-            indices[batch_idx, queue_idx] = MAXINT
-            distances[batch_idx, queue_idx] = MAXFLOAT
+        value = indices[batch_idx, queue_idx]
+        for i in range(0, exclusions_length):
+            exclude = exclusions[batch_idx, i]
+            if exclude == MAXINT:
+                break
+            if value == exclude:
+                indices[batch_idx, queue_idx] = MAXINT
+                distances[batch_idx, queue_idx] = MAXFLOAT
 
 
 def punchout_excluded_(indices, distances, exclusions):
     (batch_size, queue_size) = indices.size()
     (batch_size2, exclusion_size) = exclusions.size()
     assert batch_size == batch_size2
+    queue_groups = int((queue_size + 1023) / 1024)
+    queue_idx_size = int((queue_size + queue_groups - 1) / queue_groups)
     grid = (batch_size, 1, 1)
-    block = (queue_size, 1, 1)
+    block = (queue_idx_size, 1, 1)
     punchout_excluded_kernel[grid, block, numba_current_stream(), 0](
         indices, distances, exclusions
     )
