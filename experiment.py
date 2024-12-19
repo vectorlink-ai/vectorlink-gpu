@@ -247,62 +247,6 @@ def cosine_distance_kernel(vec1, vec2, out):
     void(
         float32[:, ::1],
         int32[:, ::1],
-        int32[:, ::1],
-        float32[:, ::1],
-        int32[:, ::1],
-        float32[:, ::1],
-    )
-)
-def cuda_search_from_seeds_kernel(
-    query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out
-):
-    shared = numba.cuda.shared.array(0, float32)
-
-    batch_idx = cuda.blockIdx.x
-    queue_idx = cuda.blockIdx.y
-    beam_idx = cuda.blockIdx.z
-
-    vector_idx = cuda.threadIdx.x
-
-    batch_size = query_vecs.shape[0]
-    vector_count = vectors.shape[0]
-    vector_dim = query_vecs.shape[1]
-    beam_size = beams.shape[1]
-    queue_size = neighbors_to_visit.shape[1]
-
-    distance_buffer = shared[0:vector_dim]
-
-    if vector_idx >= vector_dim or queue_idx >= queue_size or batch_idx >= batch_size:
-        return
-
-    assert batch_idx < batch_size
-    assert queue_idx < queue_size
-    node_id = neighbors_to_visit[batch_idx, queue_idx]
-    if node_id == MAXINT:
-        if vector_idx == 0:
-            output_idx = queue_idx * beam_size + beam_idx
-            index_out[batch_idx, output_idx] = MAXINT
-            distance_out[batch_idx, output_idx] = MAXFLOAT
-    elif node_id < vector_count:
-        neighbor_vector_id = beams[node_id, beam_idx]
-        assert neighbor_vector_id < vector_count
-        vector = vectors[neighbor_vector_id]
-        query_vector = query_vecs[batch_idx]
-        result = cosine_distance(
-            vector, query_vector, distance_buffer, vector_dim, vector_idx
-        )
-        if vector_idx == 0:
-            output_idx = queue_idx * beam_size + beam_idx
-            index_out[batch_idx, output_idx] = neighbor_vector_id
-            distance_out[batch_idx, output_idx] = result
-    else:
-        assert False
-
-
-@cuda.jit(
-    void(
-        float32[:, ::1],
-        int32[:, ::1],
         float32[:, ::1],
     )
 )
@@ -371,6 +315,62 @@ def calculate_distances(vectors: Tensor, beams: Tensor, distances_out=None):
     ](vectors, beams, distances_out)
 
     return distances_out
+
+
+@cuda.jit(
+    void(
+        float32[:, ::1],
+        int32[:, ::1],
+        int32[:, ::1],
+        float32[:, ::1],
+        int32[:, ::1],
+        float32[:, ::1],
+    )
+)
+def cuda_search_from_seeds_kernel(
+    query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out
+):
+    shared = numba.cuda.shared.array(0, float32)
+
+    batch_idx = cuda.blockIdx.x
+    queue_idx = cuda.blockIdx.y
+    beam_idx = cuda.blockIdx.z
+
+    vector_idx = cuda.threadIdx.x
+
+    batch_size = query_vecs.shape[0]
+    vector_count = vectors.shape[0]
+    vector_dim = query_vecs.shape[1]
+    beam_size = beams.shape[1]
+    queue_size = neighbors_to_visit.shape[1]
+
+    distance_buffer = shared[0:vector_dim]
+
+    if vector_idx >= vector_dim or queue_idx >= queue_size or batch_idx >= batch_size:
+        return
+
+    assert batch_idx < batch_size
+    assert queue_idx < queue_size
+    node_id = neighbors_to_visit[batch_idx, queue_idx]
+    if node_id == MAXINT:
+        if vector_idx == 0:
+            output_idx = queue_idx * beam_size + beam_idx
+            index_out[batch_idx, output_idx] = MAXINT
+            distance_out[batch_idx, output_idx] = MAXFLOAT
+    elif node_id < vector_count:
+        neighbor_vector_id = beams[node_id, beam_idx]
+        assert neighbor_vector_id < vector_count
+        vector = vectors[neighbor_vector_id]
+        query_vector = query_vecs[batch_idx]
+        result = cosine_distance(
+            vector, query_vector, distance_buffer, vector_dim, vector_idx
+        )
+        if vector_idx == 0:
+            output_idx = queue_idx * beam_size + beam_idx
+            index_out[batch_idx, output_idx] = neighbor_vector_id
+            distance_out[batch_idx, output_idx] = result
+    else:
+        assert False
 
 
 def cuda_search_from_seeds(
@@ -530,7 +530,6 @@ def comparison(qvs, nvs):
         return results.reshape(batch_size, queue_size)
 
 
-# @log_time
 def search_from_seeds(
     query_vecs: Tensor,
     neighbors_to_visit: Tensor,
