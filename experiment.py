@@ -140,15 +140,21 @@ class Queue:
         return self.indices.size()
 
 
-@cuda.jit(void(float32[::1], int64), device=True, inline=True, fastmath=True)
+FULL_MASK = 0xFFFFFFFF
+
+
+@cuda.jit(float32(float32[::1], int64), device=True, inline=True, fastmath=True)
 def warp_reduce(vec, thread_idx):
+    val = 0.0
     if thread_idx < 32:
-        vec[thread_idx] += vec[thread_idx + 32]
-        vec[thread_idx] += vec[thread_idx + 16]
-        vec[thread_idx] += vec[thread_idx + 8]
-        vec[thread_idx] += vec[thread_idx + 4]
-        vec[thread_idx] += vec[thread_idx + 2]
-        vec[thread_idx] += vec[thread_idx + 1]
+        val = vec[thread_idx]
+        val += numba.cuda.shfl_down_sync(FULL_MASK, val, 32)
+        val += numba.cuda.shfl_down_sync(FULL_MASK, val, 16)
+        val += numba.cuda.shfl_down_sync(FULL_MASK, val, 8)
+        val += numba.cuda.shfl_down_sync(FULL_MASK, val, 4)
+        val += numba.cuda.shfl_down_sync(FULL_MASK, val, 2)
+        val += numba.cuda.shfl_down_sync(FULL_MASK, val, 1)
+    return val
 
 
 @cuda.jit(float32(float32[::1], int64, int64), device=True, inline=True, fastmath=True)
@@ -184,8 +190,10 @@ def sum(vec, dim, idx):
         return 0.0
     numba.cuda.syncthreads()
 
-    warp_reduce(vec, idx)
-    return vec[0]
+    return warp_reduce(vec, idx)
+
+
+#    return vec[0]
 
 
 @cuda.jit(void(float32[::1], float32[::1]))
