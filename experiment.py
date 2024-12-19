@@ -223,22 +223,6 @@ def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
     result = 1234.0
     if idx == 0:
         result = (1 - cos_theta) / 2
-        """
-        print(
-            "vec1: ",
-            vec1[0],
-            ",",
-            vec1[1],
-            "| vec2: ",
-            vec2[0],
-            ",",
-            vec2[1],
-            "cos_theta: ",
-            cos_theta,
-            "result: ",
-            result,
-        )
-        """
         if result < 0.0:
             result = 0.0
         elif result > 1.0:
