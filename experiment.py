@@ -66,7 +66,6 @@ class Queue:
         self.distances = torch.full(
             (num_queues, capacity), MAXFLOAT, dtype=torch.float32
         )
-        self.buffers = torch.empty((num_queues, self.length), dtype=torch.int32)
 
     def initialize_from_queue(self, queue):
         head_length = min(queue.length, self.length)
@@ -80,15 +79,10 @@ class Queue:
         vector_id_batch: Tensor,
         distances_batch: Tensor,
         exclude: Optional[Tensor] = None,  # formatted like [[0,MAXINT...],[1],[2]]
+        output_update: bool = False,
     ):
-        self.indices.record_stream(torch.cuda.current_stream())
-        self.distances.record_stream(torch.cuda.current_stream())
-        vector_id_batch.record_stream(torch.cuda.current_stream())
-        distances_batch.record_stream(torch.cuda.current_stream())
-        if exclude is not None:
-            exclude.record_stream(torch.cuda.current_stream())
-
-        self.buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
+        if output_update:
+            buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
         (batches, size_per_batch) = vector_id_batch.size()
         indices_tail = self.indices.narrow(1, self.length, size_per_batch)
         distances_tail = self.distances.narrow(1, self.length, size_per_batch)
@@ -99,8 +93,12 @@ class Queue:
             punchout_excluded_(indices_tail, distances_tail, exclude)
 
         (self.indices, self.distances) = queue_sort(self.indices, self.distances)
-        did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
-        return did_something_mask
+
+        if output_update:
+            did_something_mask = self.indices.narrow(1, 0, self.length) != buffers
+            return did_something_mask
+
+        return None
 
     def insert_random_padded(
         self,
@@ -140,13 +138,7 @@ class Queue:
         return self.indices.size()
 
 
-@cuda.jit(void(float32[::1], int64, int64, int64), device=True, inline=True)
-def sum_part(vec, dim, scale, idx):
-    if idx < scale:
-        vec[idx] += vec[idx + scale]
-
-
-@cuda.jit(void(float32[::1], int64), device=True, inline=True)
+@cuda.jit(void(float32[::1], int64), device=True, inline=True, fastmath=True)
 def warp_reduce(vec, thread_idx):
     if thread_idx < 32:
         vec[thread_idx] += vec[thread_idx + 32]
@@ -157,7 +149,7 @@ def warp_reduce(vec, thread_idx):
         vec[thread_idx] += vec[thread_idx + 1]
 
 
-@cuda.jit(float32(float32[::1], int64, int64), device=True, inline=True)
+@cuda.jit(float32(float32[::1], int64, int64), device=True, inline=True, fastmath=True)
 def sum(vec, dim, idx):
     # assert dim > 1024
 
@@ -208,6 +200,7 @@ def sum_kernel(vec, out):
     float32(float32[::1], float32[::1], float32[::1], int64, int64),
     device=True,
     inline=True,
+    fastmath=True,
 )
 def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
     groups = int((vector_dimension + 1023) / 1024)
@@ -562,6 +555,25 @@ def search_from_seeds(
         return cuda_search_from_seeds(query_vecs, neighbors_to_visit, beams, vectors)
 
 
+def test_semantics():
+    torch.set_default_device(DEVICE)
+    s1 = Stream()
+    s2 = Stream()
+    number_of_vectors = 1000
+    dimensions = 1536
+    with torch.cuda.stream(s1):
+        A = torch.nn.functional.normalize(
+            torch.torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
+        )
+    s2.wait_stream(s1)
+    with torch.cuda.stream(s2):
+        A.square_()
+        torch.torch.randn(number_of_vectors * 1_000, dimensions, dtype=torch.float32)
+        B = A.sum(dim=1)
+    torch.cuda.default_stream().wait_stream(s2)
+    print(B)
+
+
 @log_time
 def closest_vectors(
     query_vecs: Tensor,
@@ -590,57 +602,50 @@ def closest_vectors(
             dtype=torch.int32,
         )
 
-        s1 = Stream()
-        s2 = Stream()
+        visit_queue_stream = Stream()
+        search_queue_stream = Stream()
         # seen.record_stream(s2)
-        while torch.any(did_something):
+        visit_queue_stream.wait_stream(torch.cuda.default_stream())
+        progressing = True
+        count = 0
+        while progressing:
             # print_timestamp("start of loop")
             # with torch.cuda.stream(torch.cuda.current_stream()):
-            s1.wait_stream(s2)
-            with torch.cuda.stream(s1):
+            # s1.wait_stream(s2)
+            with torch.cuda.stream(visit_queue_stream):
 
                 neighbors_to_visit = visit_queue.pop_n_ids(
                     config["parallel_visit_count"]
                 )
-                neighbors_to_visit.record_stream(s1)
-
-                # s2.wait_stream(s1)
-                # with torch.cuda.stream(s2):
-                if seen is not None:
-                    seen = add_new_to_seen_(seen, neighbors_to_visit)
-
-                if seen is not None:
-                    seen.record_stream(s2)
-
-            with torch.cuda.stream(s1):
-                (_, visit_length) = neighbors_to_visit.size()
-                narrow_to = batch_size * visit_length * beam_size
 
                 (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
                     query_vecs, neighbors_to_visit, beams, vectors
                 )
-                indexes_of_comparisons.record_stream(s1)
-                distances_of_comparisons.record_stream(s1)
 
-            s2.wait_stream(s1)
-            with torch.cuda.stream(s1):
+            search_queue_stream.wait_stream(visit_queue_stream)
+            with torch.cuda.stream(search_queue_stream):
                 did_something = search_queue.insert(
                     indexes_of_comparisons,
                     distances_of_comparisons,
                     exclude=exclude,
+                    output_update=True,
                 )
-                did_something.record_stream(s1)
 
-            with torch.cuda.stream(s2):
+            with torch.cuda.stream(visit_queue_stream):
+                if seen is not None:
+                    seen = add_new_to_seen_(seen, neighbors_to_visit)
+
                 if seen is not None:
                     visit_queue.insert(
-                        indexes_of_comparisons,
-                        distances_of_comparisons,
-                        exclude=seen,
+                        indexes_of_comparisons, distances_of_comparisons, exclude=seen
                     )
-        torch.cuda.synchronize()
-        # torch.cuda.default_stream().wait_stream(s1)
-        # torch.cuda.default_stream().wait_stream(s2)
+
+            count += 1
+            if (count % config["speculative_readahead"]) == 0:
+                with torch.cuda.stream(search_queue_stream):
+                    progressing = bool(torch.any(did_something))
+
+    torch.cuda.default_stream().wait_stream(search_queue_stream)
 
     return True
 
@@ -1680,6 +1685,13 @@ if __name__ == "__main__":
         type=int,
         default=3,
     )
+    parser.add_argument(
+        "-s",
+        "--speculative_readahead",
+        help="how far to try to read-ahead before checking for progress",
+        type=int,
+        default=5,
+    )
     args = parser.parse_args()
 
     torch.set_default_device(DEVICE)
@@ -1698,6 +1710,7 @@ if __name__ == "__main__":
         "cagra_loops": args.cagra_loops,
         "batch_size": args.batch_size,
         "recall_search_queue_factor": args.recall_search_queue_factor,
+        "speculative_readahead": args.speculative_readahead,
     }
 
     vectors = generate_random_vectors(
