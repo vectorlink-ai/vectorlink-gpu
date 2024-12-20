@@ -37,24 +37,9 @@ rm -f $out/lib/python3.12/site-packages/nvidia/__pycache__/__init__.cpython-312.
       "nvidia-nvjitlink-cu12"
       "nvidia-nvtx-cu12"
       "torch"
-      "taichi"
       "numba"
     ];
     pyprojectOverrides = final: prev: {
-      pybars3 = prev.pybars3.overrideAttrs (p:{
-        nativeBuildInputs = p.nativeBuildInputs ++ [final.setuptools];
-      });
-      pymeta3 = prev.pymeta3.overrideAttrs (p:{
-        nativeBuildInputs = p.nativeBuildInputs ++ [final.setuptools];
-      });
-      triton = prev.triton.overrideAttrs (p:{
-        /*
-        postFixup = ''
-sed -i 's|/sbin/ldconfig|${glibc.bin}/bin/ldconfig|g' $out/lib/python3.12/site-packages/triton/backends/amd/driver.py
-sed -i 's|/sbin/ldconfig|${glibc.bin}/bin/ldconfig|g' $out/lib/python3.12/site-packages/triton/backends/nvidia/driver.py
-'';
-*/
-      });
       numba = prev.numba.overrideAttrs (p: {
         buildInputs = p.buildInputs ++ [tbb_2021_11];
       });

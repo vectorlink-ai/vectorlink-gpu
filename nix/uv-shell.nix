@@ -1,4 +1,4 @@
-{workspace, pythonSet, mkShell, uv, stdenv, lib, parquet-tools, rust-bin, cudaPackages, cudatoolkit, gdb}:
+{workspace, pythonSet, mkShell, uv, lib, cudaPackages, cudatoolkit, gdb}:
 let editableOverlay = workspace.mkEditablePyprojectOverlay {
       # Use environment variable
       root = "$REPO_ROOT";
@@ -11,10 +11,6 @@ mkShell {
   packages = [
     virtualenv
     uv
-    parquet-tools
-    (rust-bin.stable.latest.default.override {
-      extensions = [ "rust-src" "rust-analyzer" "clippy" ];
-    })
     gdb
   ];
   shellHook = ''
