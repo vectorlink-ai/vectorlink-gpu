@@ -15,45 +15,14 @@ import json
 import numba
 from numba import cuda, gdb_init, void, float32, int64, int32
 
+from torch.cuda import Stream
+
+from primes import PRIMES
+
 # This gives more headroom, but is harder to read
 MAXINT = 2147483647  # 2**31-1
 MAXFLOAT = 3.4028e37
 DEVICE = "cuda"
-
-
-class FakeStream:
-    def __init__(self):
-        pass
-
-    def __enter__(self):
-        pass
-
-    def __exit__(self, exception_type, exception_value, traceback):
-        pass
-
-
-def allocate_stream():
-    if False and torch.cuda.is_available():
-        return torch.cuda.Stream()
-    else:
-        return FakeStream()
-
-
-def current_stream(s):
-    if False and torch.cuda.is_available():
-        return torch.cuda.stream(s)
-    else:
-        return FakeStream()
-
-
-def wait_stream(s1, s2):
-    if False and torch.cuda.is_available():
-        s1.stream_wait(s2)
-
-
-def record_stream(A, s):
-    if False and torch.cuda.is_available():
-        A.record_stream(s)
 
 
 def timed(fn):
@@ -64,6 +33,7 @@ def timed(fn):
     result = fn()
     torch.cuda.synchronize()
     end.record()
+    torch.cuda.synchronize()
     wall_end = time.time()
     return result, start.elapsed_time(end) / 1_000, (wall_end - wall_start)
 
@@ -98,7 +68,6 @@ class Queue:
         self.distances = torch.full(
             (num_queues, capacity), MAXFLOAT, dtype=torch.float32
         )
-        self.buffers = torch.empty((num_queues, self.length), dtype=torch.int32)
 
     def initialize_from_queue(self, queue):
         head_length = min(queue.length, self.length)
@@ -112,8 +81,10 @@ class Queue:
         vector_id_batch: Tensor,
         distances_batch: Tensor,
         exclude: Optional[Tensor] = None,  # formatted like [[0,MAXINT...],[1],[2]]
+        output_update: bool = False,
     ):
-        self.buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
+        if output_update:
+            buffers = torch.narrow_copy(self.indices, 1, 0, self.length)
         (batches, size_per_batch) = vector_id_batch.size()
         indices_tail = self.indices.narrow(1, self.length, size_per_batch)
         distances_tail = self.distances.narrow(1, self.length, size_per_batch)
@@ -124,8 +95,12 @@ class Queue:
             punchout_excluded_(indices_tail, distances_tail, exclude)
 
         (self.indices, self.distances) = queue_sort(self.indices, self.distances)
-        did_something_mask = self.indices.narrow(1, 0, self.length) != self.buffers
-        return did_something_mask
+
+        if output_update:
+            did_something_mask = self.indices.narrow(1, 0, self.length) != buffers
+            return did_something_mask
+
+        return None
 
     def insert_random_padded(
         self,
@@ -136,9 +111,7 @@ class Queue:
         (batch_size, total_length) = vector_id_batch.size()
         (total_batch_size, _) = self.indices.size()
         difference = total_batch_size - batch_size
-        random_padding = generate_circulant_neighborhoods(
-            difference, primes(total_length)
-        )
+        random_padding = generate_circulant_beams(difference, primes(total_length))
         random_distances = calculate_distances(vectors, random_padding)
         ids = torch.vstack([vector_id_batch, random_padding])
         dist = torch.vstack([distances_batch, random_distances])
@@ -167,24 +140,52 @@ class Queue:
         return self.indices.size()
 
 
-@cuda.jit(void(float32[::1], int64, int64, int64), device=True)
-def sum_part(vec, dim, scale, idx):
-    if idx + scale < dim and idx < scale:
-        vec[idx] += vec[idx + scale]
+@cuda.jit(void(float32[::1], int64), device=True, inline=True, fastmath=True)
+def warp_reduce(vec, thread_idx):
+    if thread_idx < 32:
+        vec[thread_idx] += vec[thread_idx + 32]
+        vec[thread_idx] += vec[thread_idx + 16]
+        vec[thread_idx] += vec[thread_idx + 8]
+        vec[thread_idx] += vec[thread_idx + 4]
+        vec[thread_idx] += vec[thread_idx + 2]
+        vec[thread_idx] += vec[thread_idx + 1]
 
 
-@cuda.jit(float32(float32[::1], int64, int64), device=True)
+@cuda.jit(float32(float32[::1], int64, int64), device=True, inline=True, fastmath=True)
 def sum(vec, dim, idx):
-    scale = dim
-    while scale > 32:
-        scale /= 2
-        sum_part(vec, dim, scale, idx)
+    # assert dim > 1024
+
+    groups = int((dim + 1023) / 1024)
+    for group in range(1, groups):
+        inner_idx = 1024 * group + idx
+        if inner_idx >= dim:
+            break
+        vec[idx] += vec[inner_idx]
     numba.cuda.syncthreads()
-    result = 0.0
-    if idx == 0:
-        for i in range(0, scale):
-            result += vec[i]
-    return result
+
+    if idx < 512:
+        vec[idx] += vec[idx + 512]
+    else:
+        return 0.0
+    numba.cuda.syncthreads()
+    if idx < 256:
+        vec[idx] += vec[idx + 256]
+    else:
+        return 0.0
+    numba.cuda.syncthreads()
+    if idx < 128:
+        vec[idx] += vec[idx + 128]
+    else:
+        return 0.0
+    numba.cuda.syncthreads()
+    if idx < 64:
+        vec[idx] += vec[idx + 64]
+    else:
+        return 0.0
+    numba.cuda.syncthreads()
+
+    warp_reduce(vec, idx)
+    return vec[0]
 
 
 @cuda.jit(void(float32[::1], float32[::1]))
@@ -197,39 +198,31 @@ def sum_kernel(vec, out):
         out[0] = result
 
 
-@cuda.jit(float32(float32[::1], float32[::1], float32[::1], int64, int64), device=True)
+@cuda.jit(
+    float32(float32[::1], float32[::1], float32[::1], int64, int64),
+    device=True,
+    inline=True,
+    fastmath=True,
+)
 def cosine_distance(vec1, vec2, buf, vector_dimension, idx):
     groups = int((vector_dimension + 1023) / 1024)
-    for group_index in range(0, groups):
-        inner_idx = idx + group_index * 1024
+    for group_offset in range(0, groups):
+        inner_idx = idx * groups + group_offset
         if inner_idx >= vector_dimension:
             break
 
         buf[inner_idx] = vec1[inner_idx] * vec2[inner_idx]
 
     numba.cuda.syncthreads()
-    # TODO sum will only work for vectors up to dim 2048 the way things are written now
+    if groups > 1:
+        buf[idx] = buf[idx]
+    numba.cuda.syncthreads()
+    # TODO sum will only work on vectors with dim >= 1024
     cos_theta = sum(buf, vector_dimension, idx)
     numba.cuda.syncthreads()
     result = 1234.0  # intentionally a strange value so we can see results slipping
     if idx == 0:
         result = (1 - cos_theta) / 2
-        """
-        print(
-            "vec1: ",
-            vec1[0],
-            ",",
-            vec1[1],
-            "| vec2: ",
-            vec2[0],
-            ",",
-            vec2[1],
-            "cos_theta: ",
-            cos_theta,
-            "result: ",
-            result,
-        )
-        """
         if result < 0.0:
             result = 0.0
         elif result > 1.0:
@@ -254,77 +247,21 @@ def cosine_distance_kernel(vec1, vec2, out):
     void(
         float32[:, ::1],
         int32[:, ::1],
-        int32[:, ::1],
-        float32[:, ::1],
-        int32[:, ::1],
         float32[:, ::1],
     )
 )
-def cuda_search_from_seeds_kernel(
-    query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
-):
-    distance_buffer = numba.cuda.shared.array(4 * 1536, float32)
-
-    batch_idx = cuda.blockIdx.x
-    queue_idx = cuda.blockIdx.y
-    neighborhood_idx = cuda.blockIdx.z
-
-    vector_idx = cuda.threadIdx.x
-
-    batch_size = query_vecs.shape[0]
-    vector_count = vectors.shape[0]
-    vector_dim = query_vecs.shape[1]
-    neighborhood_size = neighborhoods.shape[1]
-    queue_size = neighbors_to_visit.shape[1]
-
-    if vector_idx >= vector_dim or queue_idx >= queue_size or batch_idx >= batch_size:
-        return
-
-    assert batch_idx < batch_size
-    assert queue_idx < queue_size
-    node_id = neighbors_to_visit[batch_idx, queue_idx]
-    if node_id == MAXINT:
-        if vector_idx == 0:
-            output_idx = queue_idx * neighborhood_size + neighborhood_idx
-            index_out[batch_idx, output_idx] = MAXINT
-            distance_out[batch_idx, output_idx] = MAXFLOAT
-    elif node_id < vector_count:
-        neighbor_vector_id = neighborhoods[node_id, neighborhood_idx]
-        assert neighbor_vector_id < vector_count
-        vector = vectors[neighbor_vector_id]
-        query_vector = query_vecs[batch_idx]
-        result = cosine_distance(
-            vector, query_vector, distance_buffer, vector_dim, vector_idx
-        )
-        if vector_idx == 0:
-            output_idx = queue_idx * neighborhood_size + neighborhood_idx
-            index_out[batch_idx, output_idx] = neighbor_vector_id
-            distance_out[batch_idx, output_idx] = result
-    else:
-        assert False
-
-
-@cuda.jit(
-    void(
-        float32[:, ::1],
-        int32[:, ::1],
-        float32[:, ::1],
-    )
-)
-def cuda_distances_kernel(
-    vectors: Tensor, neighborhoods: Tensor, distances_out: Tensor
-):
+def cuda_distances_kernel(vectors: Tensor, beams: Tensor, distances_out: Tensor):
     distance_buffer = numba.cuda.shared.array(4 * 1536, float32)
 
     vector_id = cuda.blockIdx.x
-    neighborhood_idx = cuda.blockIdx.y
+    beam_idx = cuda.blockIdx.y
     vector_group_idx = cuda.threadIdx.x
 
     vector_dimension = vectors.shape[1]
 
-    neighbor_id = neighborhoods[vector_id, neighborhood_idx]
+    neighbor_id = beams[vector_id, beam_idx]
     if neighbor_id == MAXINT:
-        distances_out[vector_id, neighborhood_idx] = MAXFLOAT
+        distances_out[vector_id, beam_idx] = MAXFLOAT
         return
 
     vector = vectors[vector_id]
@@ -339,55 +276,107 @@ def cuda_distances_kernel(
         print(
             "vector_id: ",
             vector_id,
-            "neighborhood_idx: ",
-            neighborhood_idx,
+            "beam_idx: ",
+            beam_idx,
             "neighbor_id: ",
             neighbor_id,
             "result: ",
             result,
         )
         """
-        distances_out[vector_id, neighborhood_idx] = result
+        distances_out[vector_id, beam_idx] = result
 
 
 @log_time
-def calculate_distances(
-    vectors: Tensor, neighborhoods: Tensor, stream=None, distances_out=None
-):
+def calculate_distances(vectors: Tensor, beams: Tensor, distances_out=None):
     assert vectors.dtype == torch.float32
     assert vectors.is_contiguous()
-    assert neighborhoods.dtype == torch.int32
-    assert neighborhoods.is_contiguous()
+    assert beams.dtype == torch.int32
+    assert beams.is_contiguous()
     if distances_out:
         assert distances_out.is_contiguous()
 
     (vector_count, vector_dimension) = vectors.size()
-    (batches, neighborhood_size) = neighborhoods.size()
+    (batches, beam_size) = beams.size()
 
     assert batches == vector_count
 
     vector_idx_group_size = min(vector_dimension, 1024)
     float_size = 4
 
-    grid = (vector_count, neighborhood_size, 1)
+    grid = (vector_count, beam_size, 1)
     block = (vector_idx_group_size, 1, 1)
 
     if not distances_out:
-        distances_out = torch.empty(
-            (vector_count, neighborhood_size), dtype=torch.float32
-        )
+        distances_out = torch.empty((vector_count, beam_size), dtype=torch.float32)
 
-    cuda_distances_kernel[grid, block, stream, vector_dimension * float_size](
-        vectors, neighborhoods, distances_out
-    )
+    cuda_distances_kernel[
+        grid, block, numba_current_stream(), vector_dimension * float_size
+    ](vectors, beams, distances_out)
 
     return distances_out
+
+
+@cuda.jit(
+    void(
+        float32[:, ::1],
+        int32[:, ::1],
+        int32[:, ::1],
+        float32[:, ::1],
+        int32[:, ::1],
+        float32[:, ::1],
+    )
+)
+def cuda_search_from_seeds_kernel(
+    query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out
+):
+    shared = numba.cuda.shared.array(0, float32)
+
+    batch_idx = cuda.blockIdx.x
+    queue_idx = cuda.blockIdx.y
+    beam_idx = cuda.blockIdx.z
+
+    vector_idx = cuda.threadIdx.x
+
+    batch_size = query_vecs.shape[0]
+    vector_count = vectors.shape[0]
+    vector_dim = query_vecs.shape[1]
+    beam_size = beams.shape[1]
+    queue_size = neighbors_to_visit.shape[1]
+
+    distance_buffer = shared[0:vector_dim]
+
+    if vector_idx >= vector_dim or queue_idx >= queue_size or batch_idx >= batch_size:
+        return
+
+    assert batch_idx < batch_size
+    assert queue_idx < queue_size
+    node_id = neighbors_to_visit[batch_idx, queue_idx]
+    if node_id == MAXINT:
+        if vector_idx == 0:
+            output_idx = queue_idx * beam_size + beam_idx
+            index_out[batch_idx, output_idx] = MAXINT
+            distance_out[batch_idx, output_idx] = MAXFLOAT
+    elif node_id < vector_count:
+        neighbor_vector_id = beams[node_id, beam_idx]
+        assert neighbor_vector_id < vector_count
+        vector = vectors[neighbor_vector_id]
+        query_vector = query_vecs[batch_idx]
+        result = cosine_distance(
+            vector, query_vector, distance_buffer, vector_dim, vector_idx
+        )
+        if vector_idx == 0:
+            output_idx = queue_idx * beam_size + beam_idx
+            index_out[batch_idx, output_idx] = neighbor_vector_id
+            distance_out[batch_idx, output_idx] = result
+    else:
+        assert False
 
 
 def cuda_search_from_seeds(
     query_vecs: Tensor,
     neighbors_to_visit: Tensor,
-    neighborhoods: Tensor,
+    beams: Tensor,
     vectors: Tensor,
 ) -> (Tensor, Tensor):
 
@@ -395,48 +384,54 @@ def cuda_search_from_seeds(
     assert query_vecs.is_contiguous()
     assert neighbors_to_visit.dtype == torch.int32
     assert neighbors_to_visit.is_contiguous()
-    assert neighborhoods.dtype == torch.int32
-    assert neighborhoods.is_contiguous()
+    assert beams.dtype == torch.int32
+    assert beams.is_contiguous()
     assert vectors.is_contiguous()
     assert vectors.dtype == torch.float32
 
     (batch_size, visit_length) = neighbors_to_visit.size()
-    (_, neighborhood_size) = neighborhoods.size()
+    (_, beam_size) = beams.size()
     (_, vector_dimension) = vectors.size()
     # TODO 1024 should probably be queried instead
-    vector_idx_group_size = min(vector_dimension, 1024)
+    number_of_groups = int((vector_dimension + 1023) / 1024)
+    vector_idx_group_size = int(
+        (vector_dimension + number_of_groups - 1) / number_of_groups
+    )
     float_size = 4
     # print(f"COUNT {COUNT}")
 
-    grid = (batch_size, visit_length, neighborhood_size)
+    grid = (batch_size, visit_length, beam_size)
     block = (vector_idx_group_size, 1, 1)
 
     # index_out = torch.empty(
-    #     (batch_size, visit_length * neighborhood_size), dtype=torch.int32, device=DEVICE
+    #     (batch_size, visit_length * beam_size), dtype=torch.int32, device=DEVICE
     # )
 
     index_out = torch.full(
-        (batch_size, visit_length * neighborhood_size),
+        (batch_size, visit_length * beam_size),
         MAXINT,
         dtype=torch.int32,
         device=DEVICE,
     )
 
     # distance_out = torch.empty(
-    #     (batch_size, visit_length * neighborhood_size),
+    #     (batch_size, visit_length * beam_size),
     #     dtype=torch.float32,
     #     device=DEVICE,
     # )
     distance_out = torch.full(
-        (batch_size, visit_length * neighborhood_size),
+        (batch_size, visit_length * beam_size),
         MAXFLOAT,
         dtype=torch.float32,
         device=DEVICE,
     )
 
-    cuda_search_from_seeds_kernel[grid, block, None, vector_dimension * float_size](
-        query_vecs, neighbors_to_visit, neighborhoods, vectors, index_out, distance_out
-    )
+    cuda_search_from_seeds_kernel[
+        grid,
+        block,
+        numba_current_stream(),
+        vector_dimension * float_size,
+    ](query_vecs, neighbors_to_visit, beams, vectors, index_out, distance_out)
     return (index_out, distance_out)
 
 
@@ -496,7 +491,7 @@ def punchout_kernel(indices: Tensor):
                 indices[batch_idx, queue_idx] = MAXINT
 
 
-def dedup_tensor_(ids: Tensor, stream=None):
+def dedup_tensor_(ids: Tensor):
     (batch_size, queue_size) = ids.size()
     assert ids.is_contiguous()
     assert ids.dtype == torch.int32
@@ -505,11 +500,11 @@ def dedup_tensor_(ids: Tensor, stream=None):
 
     grid = (batch_size, 1, 1)
     block = (queue_size, 1, 1)
-    mark_kernel[grid, block, stream, 0](ids)
-    punchout_kernel[grid, block, stream, 0](ids)
+    mark_kernel[grid, block, numba_current_stream(), 0](ids)
+    punchout_kernel[grid, block, numba_current_stream(), 0](ids)
 
 
-def dedup_tensor_pair_(ids: Tensor, distances: Tensor, stream=None):
+def dedup_tensor_pair_(ids: Tensor, distances: Tensor):
     """Assumes sorted tensors!"""
     (batch_size, queue_size) = ids.size()
     (batch_size2, queue_size2) = distances.size()
@@ -522,8 +517,8 @@ def dedup_tensor_pair_(ids: Tensor, distances: Tensor, stream=None):
 
     grid = (batch_size, 1, 1)
     block = (queue_size, 1, 1)
-    mark_kernel[grid, block, stream, 0](ids)
-    punchout_pair_kernel[grid, block, stream, 0](ids, distances)
+    mark_kernel[grid, block, numba_current_stream(), 0](ids)
+    punchout_pair_kernel[grid, block, numba_current_stream(), 0](ids, distances)
 
 
 def comparison(qvs, nvs):
@@ -535,17 +530,33 @@ def comparison(qvs, nvs):
         return results.reshape(batch_size, queue_size)
 
 
-# @log_time
 def search_from_seeds(
     query_vecs: Tensor,
     neighbors_to_visit: Tensor,
-    neighborhoods: Tensor,
+    beams: Tensor,
     vectors: Tensor,
 ):
     with profiler.record_function("search_from_seeds"):
-        return cuda_search_from_seeds(
-            query_vecs, neighbors_to_visit, neighborhoods, vectors
+        return cuda_search_from_seeds(query_vecs, neighbors_to_visit, beams, vectors)
+
+
+def test_semantics():
+    torch.set_default_device(DEVICE)
+    s1 = Stream()
+    s2 = Stream()
+    number_of_vectors = 1000
+    dimensions = 1536
+    with torch.cuda.stream(s1):
+        A = torch.nn.functional.normalize(
+            torch.torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
         )
+    s2.wait_stream(s1)
+    with torch.cuda.stream(s2):
+        A.square_()
+        torch.torch.randn(number_of_vectors * 1_000, dimensions, dtype=torch.float32)
+        B = A.sum(dim=1)
+    torch.cuda.default_stream().wait_stream(s2)
+    print(B)
 
 
 @log_time
@@ -553,17 +564,16 @@ def closest_vectors(
     query_vecs: Tensor,
     search_queue: Queue,
     vectors: Tensor,
-    neighborhoods: Tensor,
+    beams: Tensor,
     config: Dict,
     exclude: Optional[Tensor] = None,
 ):
     with profiler.record_function("closest_vectors"):
-        # print_timestamp("start of closest vectors")
         (_, vector_dimension) = vectors.size()
-        (neighborhood_count, neighborhood_size) = neighborhoods.size()
-        extra_capacity = neighborhood_size * config["parallel_visit_count"]
+        (beam_count, beam_size) = beams.size()
+        extra_capacity = beam_size * config["parallel_visit_count"]
         (batch_size, queue_capacity) = search_queue.size()
-        visit_queue_len = config["visit_queue_factor"] * config["neighborhood_size"]
+        visit_queue_len = config["visit_queue_factor"] * config["beam_size"]
         capacity = visit_queue_len + extra_capacity
         visit_queue = Queue(batch_size, visit_queue_len, capacity)
         visit_queue.initialize_from_queue(search_queue)
@@ -576,31 +586,36 @@ def closest_vectors(
             dtype=torch.int32,
         )
 
-        while torch.any(did_something):
-            # print_timestamp("start of loop")
-
+        progressing = True
+        count = 0
+        while progressing:
+            count += 1
+            checking_output = (count % config["speculative_readahead"]) == 0
             neighbors_to_visit = visit_queue.pop_n_ids(config["parallel_visit_count"])
+
+            (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
+                query_vecs, neighbors_to_visit, beams, vectors
+            )
+
+            did_something = search_queue.insert(
+                indexes_of_comparisons,
+                distances_of_comparisons,
+                exclude=exclude,
+                output_update=checking_output,
+            )
 
             if seen is not None:
                 seen = add_new_to_seen_(seen, neighbors_to_visit)
 
-            (_, visit_length) = neighbors_to_visit.size()
-            narrow_to = batch_size * visit_length * neighborhood_size
-
-            (indexes_of_comparisons, distances_of_comparisons) = search_from_seeds(
-                query_vecs,
-                neighbors_to_visit,
-                neighborhoods,
-                vectors,
-            )
-
-            did_something = search_queue.insert(
-                indexes_of_comparisons, distances_of_comparisons, exclude=exclude
-            )
             if seen is not None:
                 visit_queue.insert(
                     indexes_of_comparisons, distances_of_comparisons, exclude=seen
                 )
+
+            if checking_output:
+                progressing = bool(torch.any(did_something))
+
+    # torch.cuda.default_stream().wait_stream(search_queue_stream)
 
     return True
 
@@ -676,11 +691,11 @@ def index_by_tensor(a: Tensor, b: Tensor):
         return a
 
 
-def index_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
+def index_sort(beams: Tensor, beam_distances: Tensor):
     with profiler.record_function("index_sort"):
-        (ns, indices) = neighborhoods.sort(1)
+        (ns, indices) = beams.sort(1)
 
-        nds = index_by_tensor(neighborhood_distances, indices)
+        nds = index_by_tensor(beam_distances, indices)
 
         (nds, indices) = nds.sort(dim=1, stable=True)
 
@@ -689,9 +704,9 @@ def index_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
         return (ns, nds)
 
 
-def queue_sort(neighborhoods: Tensor, neighborhood_distances: Tensor):
+def queue_sort(beams: Tensor, beam_distances: Tensor):
     with profiler.record_function("queue_sort"):
-        (ns, nds) = index_sort(neighborhoods, neighborhood_distances)
+        (ns, nds) = index_sort(beams, beam_distances)
         return punch_out_duplicates_(ns, nds)
 
 
@@ -711,13 +726,13 @@ def example_db():
         device="cuda",
     )
 
-    neighborhoods = torch.tensor(
+    beams = torch.tensor(
         [[4, 6], [4, 5], [6, 7], [5, 7], [0, 1], [1, 3], [0, 2], [2, 3]],
         dtype=torch.int32,
         device="cuda",
     )
 
-    return (vs, neighborhoods)
+    return (vs, beams)
 
 
 def two_hop(ns: Tensor):
@@ -725,400 +740,11 @@ def two_hop(ns: Tensor):
     return ns.index_select(0, ns.flatten()).flatten().view(dim1, dim2 * dim2)
 
 
-PRIMES = torch.tensor(
-    [
-        1009007,
-        1009037,
-        1009049,
-        1009061,
-        1009097,
-        1009121,
-        1009139,
-        1009153,
-        1009157,
-        1009159,
-        1009163,
-        1009189,
-        1009193,
-        1009199,
-        1009201,
-        1009207,
-        1009237,
-        1009243,
-        1009247,
-        1009259,
-        1009289,
-        1009291,
-        1009301,
-        1009303,
-        1009319,
-        1009321,
-        1009343,
-        1009357,
-        1009361,
-        1009369,
-        1009373,
-        1009387,
-        1009399,
-        1009417,
-        1009433,
-        1009439,
-        1009457,
-        1009483,
-        1009487,
-        1009499,
-        1009501,
-        1009507,
-        1009531,
-        1009537,
-        1009559,
-        1009573,
-        1009601,
-        1009609,
-        1009621,
-        1009627,
-        1009637,
-        1009643,
-        1009649,
-        1009651,
-        1009669,
-        1009727,
-        1009741,
-        1009747,
-        1009781,
-        1009787,
-        1009807,
-        1009819,
-        1009837,
-        1009843,
-        1009859,
-        1009873,
-        1009901,
-        1009909,
-        1009927,
-        1009937,
-        1009951,
-        1009963,
-        1009991,
-        1009993,
-        1009997,
-        1,
-        2,
-        59063,
-        79193,
-        3,
-        5,
-        7,
-        11,
-        13,
-        17,
-        19,
-        23,
-        29,
-        31,
-        37,
-        41,
-        43,
-        47,
-        53,
-        59,
-        61,
-        67,
-        71,
-        73,
-        79,
-        83,
-        89,
-        97,
-        101,
-        103,
-        107,
-        109,
-        113,
-        127,
-        131,
-        137,
-        139,
-        149,
-        151,
-        157,
-        163,
-        167,
-        173,
-        179,
-        181,
-        191,
-        193,
-        197,
-        199,
-        211,
-        223,
-        227,
-        229,
-        233,
-        239,
-        241,
-        251,
-        257,
-        263,
-        269,
-        271,
-        277,
-        281,
-        283,
-        293,
-        307,
-        311,
-        313,
-        317,
-        331,
-        337,
-        347,
-        349,
-        353,
-        359,
-        367,
-        373,
-        379,
-        383,
-        389,
-        397,
-        401,
-        409,
-        419,
-        421,
-        431,
-        433,
-        439,
-        443,
-        449,
-        457,
-        461,
-        463,
-        467,
-        479,
-        487,
-        491,
-        499,
-        503,
-        509,
-        521,
-        523,
-        541,
-        547,
-        557,
-        563,
-        569,
-        571,
-        577,
-        587,
-        593,
-        599,
-        601,
-        607,
-        613,
-        617,
-        619,
-        631,
-        641,
-        643,
-        647,
-        653,
-        659,
-        661,
-        673,
-        677,
-        683,
-        691,
-        701,
-        709,
-        719,
-        727,
-        733,
-        739,
-        743,
-        751,
-        757,
-        761,
-        769,
-        773,
-        787,
-        797,
-        809,
-        811,
-        821,
-        823,
-        827,
-        829,
-        839,
-        853,
-        857,
-        859,
-        863,
-        877,
-        881,
-        883,
-        887,
-        907,
-        911,
-        919,
-        929,
-        937,
-        941,
-        947,
-        953,
-        967,
-        971,
-        977,
-        983,
-        991,
-        997,
-        1009,
-        1013,
-        1019,
-        1021,
-        1031,
-        1033,
-        1039,
-        1049,
-        1051,
-        1061,
-        1063,
-        1069,
-        1087,
-        1091,
-        1093,
-        1097,
-        1103,
-        1109,
-        1117,
-        1123,
-        1129,
-        1151,
-        1153,
-        1163,
-        1171,
-        1181,
-        1187,
-        1193,
-        1201,
-        1213,
-        1217,
-        1223,
-        1229,
-        1231,
-        1237,
-        1249,
-        1259,
-        1277,
-        1279,
-        1283,
-        1289,
-        1291,
-        1297,
-        1301,
-        1303,
-        1307,
-        1319,
-        1321,
-        1327,
-        1361,
-        1367,
-        1373,
-        1381,
-        1399,
-        1409,
-        1423,
-        1427,
-        1429,
-        1433,
-        1439,
-        1447,
-        1451,
-        1453,
-        1459,
-        1471,
-        1481,
-        1483,
-        1487,
-        1489,
-        1493,
-        1499,
-        1511,
-        1523,
-        1531,
-        1543,
-        1549,
-        1553,
-        1559,
-        1567,
-        1571,
-        1579,
-        1583,
-        1597,
-        1601,
-        1607,
-        1609,
-        1613,
-        1619,
-        1621,
-        1627,
-        1637,
-        1657,
-        1663,
-        1667,
-        1669,
-        1693,
-        1697,
-        1699,
-        1709,
-        1721,
-        1723,
-        1733,
-        1741,
-        1747,
-        1753,
-        1759,
-        1777,
-        1783,
-        1787,
-        1789,
-        1801,
-        1811,
-        1823,
-        1831,
-        1847,
-        1861,
-        1867,
-        1871,
-        1873,
-        1877,
-        1879,
-        1889,
-        1901,
-        1907,
-        1913,
-        1931,
-        1933,
-        1949,
-        1951,
-        1973,
-        1979,
-        1987,
-        1993,
-        1997,
-        1999,
-    ],
-    dtype=torch.int32,
-    device=DEVICE,
-)
-
-
 def primes(size: int):
     return PRIMES.narrow(0, 0, size)
 
 
-def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
+def generate_circulant_beams(num_vecs: int, primes: Tensor) -> Tensor:
     indices = torch.arange(num_vecs, device=DEVICE, dtype=torch.int32)
     (nhs,) = primes.size()
     repeated_indices = indices.expand(nhs, num_vecs).transpose(0, 1)
@@ -1129,10 +755,10 @@ def generate_circulant_neighborhoods(num_vecs: int, primes: Tensor) -> Tensor:
 
 def generate_layered_ann(vectors: Tensor, config: Dict):
     """ """
-    neighborhood_size = config["neighborhood_size"]
+    beam_size = config["beam_size"]
     layers = []
     (count, _) = vectors.size()
-    order = neighborhood_size * 3
+    order = beam_size * 3
     size = 10_000
     while True:
         bound = min(size, count)
@@ -1149,25 +775,25 @@ def generate_layered_ann(vectors: Tensor, config: Dict):
 def generate_hnsw(vectors: Tensor, config: Dict):
     """ """
     (vector_count, _) = vectors.size()
-    neighborhood_size = config["neighborhood_size"]
-    order = neighborhood_size * 3
+    beam_size = config["beam_size"]
+    order = beam_size * 3
     layer_size = order
     bound = min(layer_size, vector_count)
-    (ann, distances) = generate_ann(neighborhood_size, vectors[0:bound])
+    (ann, distances) = generate_ann(beam_size, vectors[0:bound])
 
     layers = [ann]
-    queue_length = neighborhood_size * config["neighborhood_queue_factor"]
+    queue_length = beam_size * config["beam_queue_factor"]
     remaining_capacity = queue_length * config["parallel_visit_count"]
 
     queue = Queue(
         bound,
         queue_length,
         queue_length + remaining_capacity,
-    )  # make que from neighborhoods + neigbhorhood_distances
+    )  # make que from beams + neigbhorhood_distances
     # print("neigbhorhoods")
-    # print(neighborhoods)
-    # print("neighborhood distances")
-    # print(neighborhood_distances)
+    # print(beams)
+    # print("beam distances")
+    # print(beam_distances)
 
     c = 0
     print(f"layer_size: {layer_size}, vector_count: {vector_count}")
@@ -1186,11 +812,11 @@ def generate_hnsw(vectors: Tensor, config: Dict):
         qvs = vectors[:bound]
         search_layers(layers, qvs, queue, vectors)
 
-        ann = queue.indices.narrow_copy(1, 0, neighborhood_size)
+        ann = queue.indices.narrow_copy(1, 0, beam_size)
         print(ann)
         print(f"Isolated layer recall")
         ann_calculate_recall(vectors[:bound], ann)
-        distances = queue.distances.narrow_copy(1, 0, neighborhood_size)
+        distances = queue.distances.narrow_copy(1, 0, beam_size)
 
         layers.append(ann)
         c += 1
@@ -1201,16 +827,16 @@ def generate_hnsw(vectors: Tensor, config: Dict):
 def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
     # print_timestamp("generating ann")
     (num_vecs, vec_dim) = vectors.size()
-    neighborhood_size = config["neighborhood_size"]
-    queue_length = neighborhood_size * config["neighborhood_queue_factor"]
+    beam_size = config["beam_size"]
+    queue_length = beam_size * config["beam_queue_factor"]
     neighbor_primes = primes(queue_length)
-    neighborhoods = generate_circulant_neighborhoods(num_vecs, neighbor_primes)
-    assert neighborhoods.dtype == torch.int32
-    # print_timestamp("circulant neighborhoods generated")
-    neighborhood_distances = calculate_distances(vectors, neighborhoods)
+    beams = generate_circulant_beams(num_vecs, neighbor_primes)
+    assert beams.dtype == torch.int32
+    # print_timestamp("circulant beams generated")
+    beam_distances = calculate_distances(vectors, beams)
 
     # print_timestamp("distances calculated")
-    # we want to be able to add a 'big' neighborhood at the end, which happens to be queue_length
+    # we want to be able to add a 'big' beam at the end, which happens to be queue_length
     remaining_capacity = queue_length * config["parallel_visit_count"]
 
     batch_size = config["batch_size"]
@@ -1219,8 +845,8 @@ def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
 
     for i in range(0, config["cagra_loops"]):
         print_timestamp(f"start of cagra loop {i}")
-        next_neighborhoods = torch.empty_like(neighborhoods)
-        next_neighborhood_distances = torch.empty_like(neighborhood_distances)
+        next_beams = torch.empty_like(beams)
+        next_beam_distances = torch.empty_like(beam_distances)
         for batch_count in range(0, number_of_batches):
             print_timestamp(f"  start of batch loop {batch_count}")
             batch_start_idx = batch_count * batch_size
@@ -1234,50 +860,44 @@ def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
                 queue_length,
                 queue_length + remaining_capacity,
             )
-            neighborhoods_slice = neighborhoods.narrow(0, batch_start_idx, batch)
-            neighborhood_distances_slice = neighborhood_distances.narrow(
-                0, batch_start_idx, batch
-            )
-            queue.insert(neighborhoods_slice, neighborhood_distances_slice)
+            beams_slice = beams.narrow(0, batch_start_idx, batch)
+            beam_distances_slice = beam_distances.narrow(0, batch_start_idx, batch)
+            queue.insert(beams_slice, beam_distances_slice)
 
             closest_vectors(
                 vectors[batch_start_idx:batch_end_idx],
                 queue,
                 vectors,
-                neighborhoods,
+                beams,
                 config,
                 exclude,
             )
 
-            next_neighborhoods_slice = next_neighborhoods.narrow(
-                0, batch_start_idx, batch
-            )
-            next_neighborhood_distance_slice = next_neighborhood_distances.narrow(
+            next_beams_slice = next_beams.narrow(0, batch_start_idx, batch)
+            next_beam_distance_slice = next_beam_distances.narrow(
                 0, batch_start_idx, batch
             )
             queue_indices = queue.indices.narrow(1, 0, queue_length)
             queue_distances = queue.distances.narrow(1, 0, queue_length)
-            next_neighborhoods_slice.copy_(queue_indices)
-            next_neighborhood_distance_slice.copy_(queue_distances)
+            next_beams_slice.copy_(queue_indices)
+            next_beam_distance_slice.copy_(queue_distances)
             remaining -= batch
 
         remaining = num_vecs
 
         ## We prune here!
         if config["prune"]:
-            (neighborhoods, distances) = prune_(
-                next_neighborhoods, next_neighborhood_distances
-            )
+            (beams, distances) = prune_(next_beams, next_beam_distances)
         else:
-            (neighborhoods, distances) = (
-                next_neighborhoods,
-                next_neighborhood_distances,
+            (beams, distances) = (
+                next_beams,
+                next_beam_distances,
             )
 
         prefix = min(vectors.size()[0], 1000)
         (found, recall) = ann_calculate_recall(
             vectors,
-            neighborhoods.narrow_copy(1, 0, neighborhood_size),
+            beams.narrow_copy(1, 0, beam_size),
             config,
             sample=vectors[:prefix],
         )
@@ -1286,45 +906,66 @@ def generate_ann(vectors: Tensor, config: Dict) -> Tensor:
             break
         print_timestamp(f"end of cagra loop {i}")
     return (
-        neighborhoods.narrow_copy(1, 0, neighborhood_size),
-        neighborhood_distances.narrow_copy(1, 0, neighborhood_size),
+        beams.narrow_copy(1, 0, beam_size),
+        beam_distances.narrow_copy(1, 0, beam_size),
     )
 
 
 @cuda.jit(void(int32[:, :], float32[:, :], int32[:, :]))
 def punchout_excluded_kernel(indices: Tensor, distances: Tensor, exclusions: Tensor):
+    queue_size = indices.shape[1]
     exclusions_length = exclusions.shape[1]
     batch_idx = cuda.blockIdx.x
-    queue_idx = cuda.threadIdx.x
+    queue_groups = int((queue_size + 1023) / 1024)
+    queue_group_idx = cuda.threadIdx.x
+    for group in range(0, queue_groups):
+        queue_idx = queue_group_idx * queue_groups + group
 
-    value = indices[batch_idx, queue_idx]
-    for i in range(0, exclusions_length):
-        exclude = exclusions[batch_idx, i]
-        if exclude == MAXINT:
-            break
-        if value == exclude:
-            indices[batch_idx, queue_idx] = MAXINT
-            distances[batch_idx, queue_idx] = MAXFLOAT
+        value = indices[batch_idx, queue_idx]
+        for i in range(0, exclusions_length):
+            exclude = exclusions[batch_idx, i]
+            if exclude == MAXINT:
+                break
+            if value == exclude:
+                indices[batch_idx, queue_idx] = MAXINT
+                distances[batch_idx, queue_idx] = MAXFLOAT
 
 
-def punchout_excluded_(indices, distances, exclusions, stream=None):
+def punchout_excluded_(indices, distances, exclusions):
     (batch_size, queue_size) = indices.size()
     (batch_size2, exclusion_size) = exclusions.size()
     assert batch_size == batch_size2
+    queue_groups = int((queue_size + 1023) / 1024)
+    queue_idx_size = int((queue_size + queue_groups - 1) / queue_groups)
     grid = (batch_size, 1, 1)
-    block = (queue_size, 1, 1)
-    punchout_excluded_kernel[grid, block, stream, 0](indices, distances, exclusions)
+    block = (queue_idx_size, 1, 1)
+    punchout_excluded_kernel[grid, block, numba_current_stream(), 0](
+        indices, distances, exclusions
+    )
+
+
+def numba_current_stream():
+    torch_current_stream = torch.cuda.current_stream()
+    return numba.cuda.external_stream(torch_current_stream.cuda_stream)
+
+
+def stream_to_numba(stream: Optional[Stream]):
+    numba_stream = None
+    if stream is not None:
+        numba_stream = numba.cuda.external_stream(stream.cuda_stream)
+
+    return numba_stream
 
 
 def initial_queue(vectors: Tensor, config: Dict):
-    queue_size = config["recall_search_queue_factor"] * config["neighborhood_size"]
+    queue_size = config["recall_search_queue_factor"] * config["beam_size"]
     (batch_size, _) = vectors.size()
     extra_capacity = max(
-        queue_size, config["parallel_visit_count"] * config["neighborhood_size"]
+        queue_size, config["parallel_visit_count"] * config["beam_size"]
     )
     queue = Queue(batch_size, queue_size, queue_size + extra_capacity)
     p = primes(queue_size)
-    initial_queue_indices = generate_circulant_neighborhoods(batch_size, p)
+    initial_queue_indices = generate_circulant_beams(batch_size, p)
     d = calculate_distances(vectors, initial_queue_indices)
     queue.insert(initial_queue_indices, d)
 
@@ -1333,19 +974,19 @@ def initial_queue(vectors: Tensor, config: Dict):
 
 def ann_calculate_recall(
     vectors: Tensor,
-    neighborhoods: Tensor,
+    beams: Tensor,
     config: Dict,
     sample: Optional[Tensor] = None,
 ):
     if sample is None:
         sample = vectors
     (sample_size, _) = sample.size()
-    (_, neighborhood_size) = neighborhoods.size()
+    (_, beam_size) = beams.size()
 
     queue = initial_queue(sample, config)
     # print_timestamp("queues allocated")
 
-    closest_vectors(sample, queue, vectors, neighborhoods, config)
+    closest_vectors(sample, queue, vectors, beams, config)
     # print_timestamp("closest vectors calculated")
     expected = torch.arange(sample_size)
     actual = queue.indices.t()[0]
@@ -1365,7 +1006,7 @@ def hnsw_calculate_recall(
         sample = vectors
     (sample_size, _) = sample.size()
 
-    (_, neighborhood_size) = hnsw[-1].size()
+    (_, beam_size) = hnsw[-1].size()
 
     queue = initial_queue(sample, config)
     # print_timestamp("queues allocated")
@@ -1385,11 +1026,11 @@ def hnsw_calculate_recall(
 
 def ann_recall_test(vectors: Tensor, config: Dict):
     # print_timestamp("vectors allocated")
-    (neighborhoods, _) = generate_ann(vectors, config)
+    (beams, _) = generate_ann(vectors, config)
     print_timestamp("=> ANN generated")
 
-    prefix = min(vectors.size()[0], 1000)
-    return ann_calculate_recall(vectors, neighborhoods, config, sample=vectors[:prefix])
+    prefix = min(vectors.size()[0], 10_000)
+    return ann_calculate_recall(vectors, beams, config, sample=vectors[:prefix])
 
 
 def layered_ann_recall_test(vectors: Tensor, config):
@@ -1500,7 +1141,7 @@ def prune_(beams, distances):
     (batch_size, beam_size) = beams.size()
     grid = (batch_size, beam_size, 1)
     block = (beam_size, 1, 1)
-    prune_kernel[grid, block, None, 0](beams, distances)
+    prune_kernel[grid, block, numba_current_stream(), 0](beams, distances)
 
     (distances, permutation) = distances.sort()
     beams = index_by_tensor(beams, permutation)
@@ -1508,25 +1149,32 @@ def prune_(beams, distances):
 
 
 def grid_search():
+    torch.set_default_device(DEVICE)
+    torch.set_float32_matmul_precision("high")
     config = {
         "type": "cagra",
         "vector_count": 1_000_000,
         "vector_dimension": 1536,
         "exclude_factor": 5,
         "batch_size": 10_000,
+        "beam_queue_factor": 3,
         "recall_search_queue_factor": 6,
     }
+    vectors = generate_random_vectors(
+        number_of_vectors=config["vector_count"], dimensions=config["vector_dimension"]
+    )
 
     os.makedirs("./grid-log", exist_ok=True)
     for prune in [True, False]:
-        for neighborhood_size in [24, 32, 46]:
+        for beam_size in [24, 32, 46]:
             for parallel_visit_count in [1, 4]:
                 for cagra_loops in [1, 2]:
                     for visit_queue_factor in [3, 4]:
                         config["prune"] = prune
-                        config["neigbhorhood_size"] = neighborhood_size
+                        config["beam_size"] = beam_size
                         config["parallel_visit_count"] = parallel_visit_count
                         config["visit_queue_factor"] = visit_queue_factor
+                        config["cagra_loops"] = cagra_loops
                         result = main(vectors, config)
                         log_name = f"./grid-log/experiment-{time.time()}.log"
                         with open(log_name, "w") as w:
@@ -1534,23 +1182,27 @@ def grid_search():
 
 
 def main(vectors, configuration):
+    start = time.time()
     recall = 0.0
     if configuration["type"] == "layered":
         print("LAYERED ANN >>>>>")
-        (_, recall) = layered_ann_recall_test(vectors, build_params)
+        (_, recall) = layered_ann_recall_test(vectors, configuration)
         print("<<<<< FINISHED LAYERED ANN")
     else:
         print("CAGRA ANN >>>>>")
-        (_, recall) = ann_recall_test(vectors, build_params)
+        (_, recall) = ann_recall_test(vectors, configuration)
         print("<<<<< FINISHED CAGRA")
+    end = time.time()
 
-    commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
-
-    configuration["commit"] = commit.decode("utf-8").strip()
+    configuration["construction_time"] = end - start
     configuration["recall"] = recall
+    commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
+    configuration["commit"] = commit.decode("utf-8").strip()
+    gpu_arch = subprocess.check_output(["nvidia-smi", "-L"])
+    configuration["gpu_arch"] = gpu_arch.decode("utf-8").strip()
     configuration["closest_vectors_batch_time"] = CLOSEST_VECTORS_BATCH_TIME
 
-    return build_params
+    return configuration
 
 
 if __name__ == "__main__":
@@ -1559,7 +1211,7 @@ if __name__ == "__main__":
         "-c", "--vector-count", help="number of vectors", type=int, default=10_000
     )
     parser.add_argument(
-        "-d", "--vector-dimension", help="dimension of vectors", type=int, default=1024
+        "-d", "--vector-dimension", help="dimension of vectors", type=int, default=1536
     )
     parser.add_argument(
         "-L", "--layered", help="use layered cagra", default=False, action="store_true"
@@ -1572,8 +1224,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-n",
-        "--neighborhood_size",
-        help="beam or neighborhood size",
+        "--beam_size",
+        help="beam size (max number of neighbors)",
         type=int,
         default=24,
     )
@@ -1588,21 +1240,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "-q",
         "--visit_queue_factor",
-        help="factor larger than neighborhood for visit queue",
+        help="factor larger than beam for visit queue",
         type=int,
         default=3,
     )
     parser.add_argument(
         "-f",
-        "--neighborhood_queue_factor",
-        help="factor larger than neighborhood for initial beams",
+        "--beam_queue_factor",
+        help="factor larger than beam for initial beams",
         type=int,
         default=3,
     )
     parser.add_argument(
         "-b",
         "--batch_size",
-        help="how many vectors/neighborhoods to run per batch",
+        help="how many vectors/beams to run per batch",
         type=int,
         default=10_000,
     )
@@ -1620,6 +1272,13 @@ if __name__ == "__main__":
         type=int,
         default=3,
     )
+    parser.add_argument(
+        "-s",
+        "--speculative_readahead",
+        help="how far to try to read-ahead before checking for progress",
+        type=int,
+        default=5,
+    )
     args = parser.parse_args()
 
     torch.set_default_device(DEVICE)
@@ -1630,19 +1289,21 @@ if __name__ == "__main__":
         "vector_count": args.vector_count,
         "vector_dimension": args.vector_dimension,
         "prune": args.prune,
-        "neighborhood_size": args.neighborhood_size,
+        "beam_size": args.beam_size,
         "parallel_visit_count": args.parallel_visit_count,
-        "neighborhood_queue_factor": args.neighborhood_queue_factor,
+        "beam_queue_factor": args.beam_queue_factor,
         "visit_queue_factor": args.visit_queue_factor,
         "exclude_factor": args.exclude_factor,
         "cagra_loops": args.cagra_loops,
         "batch_size": args.batch_size,
         "recall_search_queue_factor": args.recall_search_queue_factor,
+        "speculative_readahead": args.speculative_readahead,
     }
 
     vectors = generate_random_vectors(
         number_of_vectors=args.vector_count, dimensions=args.vector_dimension
     )
+
     configuration = main(vectors, build_params)
 
     os.makedirs("./log", exist_ok=True)
