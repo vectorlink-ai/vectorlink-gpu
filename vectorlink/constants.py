@@ -1,5 +1,11 @@
 import torch
 
+DEBUG = False
+MAXINT = 2147483647  # 2**31-1
+MAXFLOAT = 3.4028e37  # Works on NVidia
+DEVICE = "cuda"
+
+# Better ordering (random?) might be a good idea
 PRIMES = torch.tensor(
     [
         10000349,
