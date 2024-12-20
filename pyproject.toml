@@ -4,23 +4,7 @@ version = "0.1.0"
 description = "get torch installed"
 requires-python = ">=3.12"
 dependencies = [
-    "backoff>=2.2.1",
-    "dagster-openai>=0.25.2",
-    "dagster-webserver>=1.9.2",
-    "dagster>=1.9.2",
-    "datafusion>=42.0.0",
-    "holistictraceanalysis>=0.2.0",
-    "kmeans-gpu>=0.0.5",
-    "numpy>=1.22,<2.1",
-    "openai>=1.55.0",
-    "pandas>=2.2.3",
-    "pyarrow>=18.0.0",
-    "pybars3>=0.9.7",
-    "tensorboard>=2.18.0",
-    "torch-kmeans>=0.2.0",
-    "torch-tb-profiler>=0.4.3",
     "torch==2.5.0",
-    "urllib3>=2.2.3",
     "numba==0.61rc1",
 ]
 
