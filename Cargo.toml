@@ -1,7 +1,0 @@
-[package]
-name = "torch-hnsw"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-tch = "0.18.0"
