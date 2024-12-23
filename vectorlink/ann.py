@@ -10,23 +10,19 @@ import subprocess
 import argparse
 from typing import Dict
 import json
+import time
 
-import numba
-from numba import cuda, gdb_init, void, float32, int64, int32
-
-from torch.cuda import Stream
-
-from .constants import PRIMES, MAXINT, MAXFLOAT, DEVICE
+from .constants import MAXINT, MAXFLOAT, DEVICE
 from .queue import Queue
-from .kernels import search_from_seeds, dedup_tensor_, calculate_distances
+from .kernels import search_from_seeds, dedup_tensor_, calculate_distances, prune_
 from .utils import (
-    log_time,
     index_sort,
     index_by_tensor,
     generate_circulant_beams,
     primes,
     add_new_to_seen_,
 )
+from .logging import log_time, CLOSEST_VECTORS_BATCH_TIME
 
 
 @log_time
@@ -264,25 +260,6 @@ def ann_recall_test(vectors: Tensor, config: Dict):
     return ann_calculate_recall(vectors, beams, config, sample=vectors[:prefix])
 
 
-def layered_ann_recall_test(vectors: Tensor, config):
-    # print_timestamp("vectors allocated")
-    hnsw = generate_layered_ann(vectors, config)
-    print_timestamp("=> Layered ANN generated")
-    return hnsw_calculate_recall(vectors, hnsw, config)
-
-
-def hnsw_recall_test(vectors: Tensor, config):
-    # print_timestamp("vectors allocated")
-    hnsw = generate_hnsw(vectors, config)
-    for layer in hnsw:
-        (a, b) = layer.size()
-        print(f"shape: ({a}, {b})")
-
-    print_timestamp("=> HNSW generated")
-
-    hnsw_calculate_recall(vectors, hnsw, config)
-
-
 def generate_random_vectors(number_of_vectors: int, dimensions: int = 1536) -> Tensor:
     vectors = torch.nn.functional.normalize(
         torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
@@ -366,6 +343,9 @@ class ANN:
         speculative_readahead: int = 5,
     ):
         (count, dim) = vectors.size()
+        torch.set_default_device(DEVICE)
+        torch.set_float32_matmul_precision("high")
+
         self.configuration = {
             "vector_count": count,
             "vector_dimension": dim,
@@ -397,32 +377,38 @@ class ANN:
 
         return (found, found / sample_size)
 
-    def search():
+    def clusters(self):
         pass
+
+    def search(self, query: Tensor) -> Queue:
+        """
+        Search takes a query tensor, structured as a batch of vectors to search - it returns a Queue object.
+        """
+        search_queue = initial_queue(query, self.configuration)
+        closest_vectors(
+            query, search_queue, self.vectors, self.beams, self.configuration, None
+        )
+        return search_queue
+
+    def dump_logs(self) -> Dict:
+        global CLOSEST_VECTORS_BATCH_TIME
+        log = self.configuration.copy()
+        log["closest_vectors_batch_time"] = CLOSEST_VECTORS_BATCH_TIME
+        gpu_arch = subprocess.check_output(["nvidia-smi", "-L"])
+        log["gpu_arch"] = gpu_arch.decode("utf-8").strip()
+        commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
+        log["commit"] = commit.decode("utf-8").strip()
+        (_, recall) = self.calculate_recall()
+        return log
 
 
 def main(vectors, configuration):
     start = time.time()
-    recall = 0.0
-    if configuration["type"] == "layered":
-        print("LAYERED ANN >>>>>")
-        (_, recall) = layered_ann_recall_test(vectors, configuration)
-        print("<<<<< FINISHED LAYERED ANN")
-    else:
-        print("CAGRA ANN >>>>>")
-        (_, recall) = ann_recall_test(vectors, configuration)
-        print("<<<<< FINISHED CAGRA")
+    ann = ANN(vectors=vectors, **configuration)
+    recall = ann.recall()
     end = time.time()
 
-    configuration["construction_time"] = end - start
-    configuration["recall"] = recall
-    commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
-    configuration["commit"] = commit.decode("utf-8").strip()
-    gpu_arch = subprocess.check_output(["nvidia-smi", "-L"])
-    configuration["gpu_arch"] = gpu_arch.decode("utf-8").strip()
-    configuration["closest_vectors_batch_time"] = CLOSEST_VECTORS_BATCH_TIME
-
-    return configuration
+    return self.configuration
 
 
 if __name__ == "__main__":
@@ -507,7 +493,6 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
 
     build_params = {
-        "type": "layered" if args.layered else "cagra",
         "vector_count": args.vector_count,
         "vector_dimension": args.vector_dimension,
         "prune": args.prune,
