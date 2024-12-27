@@ -502,6 +502,7 @@ def punchout_excluded_(indices, distances, exclusions):
     )
 
 
+@cuda.jit(void(int32[:, ::1], float32[:, ::1]))
 def symmetrize_kernel(beams, distances, output_beams, output_distances):
     pass
 
