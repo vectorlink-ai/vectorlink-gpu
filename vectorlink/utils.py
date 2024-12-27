@@ -1,7 +1,7 @@
 from torch import Tensor
 import torch
 from .constants import PRIMES, DEVICE, DEBUG
-from .kernels import punch_out_duplicates_
+from .kernels import punch_out_duplicates_, dedup_tensor_
 
 import time
 

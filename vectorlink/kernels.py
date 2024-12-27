@@ -500,3 +500,24 @@ def punchout_excluded_(indices, distances, exclusions):
     punchout_excluded_kernel[grid, block, numba_current_stream(), 0](
         indices, distances, exclusions
     )
+
+
+def symmetrize_kernel(beams, distances, output_beams, output_distances):
+    pass
+
+
+def symmetrize(beams: Tensor, distances: Tensor) -> Tuple[Tensor, Tensor]:
+    """
+    creates an approximate symmetrization for the graph.
+
+    For a given node_id, scan the beams for this node_id, and add each beam origin which contains it.
+
+    """
+    (batch_size, queue_size) = beams.size()
+    queue_groups = int((queue_size + 1023) / 1024)
+    queue_idx_size = int((queue_size + queue_groups - 1) / queue_groups)
+    grid = (batch_size, 1, 1)
+    block = (queue_idx_size, 1, 1)
+    symmetrize_kernel[grid, block, numba_current_stream(), 0](
+        beams, distances, output_beams, output_distances
+    )
