@@ -1,16 +1,21 @@
 from torch import Tensor
 import torch
 from typing import Optional
+from torch import profiler
 
 from .constants import MAXINT, MAXFLOAT
-from .kernels import punchout_excluded_, calculate_distances, punch_out_duplicates_
-from .utils import primes, generate_circulant_beams
+from .kernels import (
+    punchout_excluded_,
+    calculate_distances,
+    punchout_duplicates_,
+)
+from .utils import primes, generate_circulant_beams, index_sort
 
 
 def queue_sort(beams: Tensor, beam_distances: Tensor):
     with profiler.record_function("queue_sort"):
         (ns, nds) = index_sort(beams, beam_distances)
-        return punch_out_duplicates_(ns, nds)
+        return punchout_duplicates_(ns, nds)
 
 
 class Queue:

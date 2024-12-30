@@ -1,15 +1,23 @@
 import vectorlink
+import argparse
+import torch
+import time
+
 from vectorlink.ann import ANN
 from vectorlink.constants import DEVICE
+from vectorlink.utils import generate_random_vectors
 
 
 def main(vectors, configuration):
     start = time.time()
-    ann = ANN(vectors=vectors, **configuration)
+    args = configuration.copy()
+    args.pop("vector_count")
+    args.pop("vector_dimension")
+    ann = ANN(vectors=vectors, **args)
     recall = ann.recall()
     end = time.time()
 
-    return self.configuration
+    return configuration
 
 
 if __name__ == "__main__":

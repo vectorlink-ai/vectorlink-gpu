@@ -1,6 +1,7 @@
 import torch
+import os
 
-DEBUG = False
+DEBUG = os.getenv("VECTORLINK_DEBUG")
 MAXINT = 2147483647  # 2**31-1
 MAXFLOAT = 3.4028e37  # Works on NVidia
 DEVICE = "cuda"

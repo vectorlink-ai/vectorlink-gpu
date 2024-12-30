@@ -1,9 +1,16 @@
 from torch import Tensor
 import torch
-from .constants import PRIMES, DEVICE, DEBUG
-from .kernels import punch_out_duplicates_, dedup_tensor_
+from .constants import PRIMES, DEVICE, DEBUG, MAXINT
+from .kernels import punchout_duplicates_, dedup_tensor_, index_by_tensor
 
 import time
+
+
+def generate_random_vectors(number_of_vectors: int, dimensions: int = 1536) -> Tensor:
+    vectors = torch.nn.functional.normalize(
+        torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
+    )
+    return vectors
 
 
 def primes(size: int):
@@ -17,15 +24,6 @@ def generate_circulant_beams(num_vecs: int, primes: Tensor) -> Tensor:
     repeated_primes = primes.expand(num_vecs, nhs)
     circulant_neighbors = repeated_indices + repeated_primes
     return circulant_neighbors.sort().values % num_vecs
-
-
-# NOTE: Potentially can be made a kernel
-def index_by_tensor(a: Tensor, b: Tensor):
-    dim1, dim2 = a.size()
-    a = a[
-        torch.arange(dim1).unsqueeze(1).expand((dim1, dim2)).flatten(), b.flatten()
-    ].view(dim1, dim2)
-    return a
 
 
 def index_sort(beams: Tensor, beam_distances: Tensor):
@@ -42,7 +40,7 @@ def index_sort(beams: Tensor, beam_distances: Tensor):
 
 def queue_sort(beams: Tensor, beam_distances: Tensor):
     (ns, nds) = index_sort(beams, beam_distances)
-    return punch_out_duplicates_(ns, nds)
+    return punchout_duplicates_(ns, nds)
 
 
 def add_new_to_seen_(seen, indices):
@@ -55,14 +53,7 @@ def add_new_to_seen_(seen, indices):
     if size == 0:
         return None
     else:
-        """
-        [ [ 0, 3,   999],
-          [ 1, 999, 999]
-        ]
-
-        [2] = [ 0 , 1,  2] [punch_mask]
-        """
-
+        "We still have space"
         first = match_indices[0]
         (new_dim1, new_dim2) = indices.size()
         remaining = dim2 - first

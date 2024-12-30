@@ -1,6 +1,8 @@
 import torch
 import time
 
+from .constants import DEBUG
+
 
 def timed(fn):
     wall_start = time.time()

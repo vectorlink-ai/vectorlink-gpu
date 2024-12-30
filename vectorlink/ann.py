@@ -7,18 +7,23 @@ from datetime import datetime
 import sys
 import os
 import subprocess
-import argparse
 from typing import Dict
 import json
 import time
 
 from .constants import MAXINT, MAXFLOAT, DEVICE
 from .queue import Queue
-from .kernels import search_from_seeds, dedup_tensor_, calculate_distances, prune_
+from .kernels import (
+    search_from_seeds,
+    dedup_tensor_,
+    calculate_distances,
+    prune_,
+    index_by_tensor,
+)
 from .utils import (
     index_sort,
-    index_by_tensor,
     generate_circulant_beams,
+    generate_random_vectors,
     primes,
     add_new_to_seen_,
 )
@@ -260,13 +265,6 @@ def ann_recall_test(vectors: Tensor, config: Dict):
     return ann_calculate_recall(vectors, beams, config, sample=vectors[:prefix])
 
 
-def generate_random_vectors(number_of_vectors: int, dimensions: int = 1536) -> Tensor:
-    vectors = torch.nn.functional.normalize(
-        torch.randn(number_of_vectors, dimensions, dtype=torch.float32), dim=1
-    )
-    return vectors
-
-
 # Function to print timestamps
 def print_timestamp(msg):
     print(msg)
@@ -361,20 +359,17 @@ class ANN:
             "speculative_readahead": speculative_readahead,
         }
         self.vectors = vectors
-        (self.distances, self.beams) = generate_ann(self.vectors, self.configuration)
+        (self.beams, self.distances) = generate_ann(self.vectors, self.configuration)
 
-    def calculate_recall(self, sample_size: int = 1000) -> Tuple[float, float]:
+    def recall(self, sample_size: int = 1000) -> Tuple[float, float]:
         (count, _) = self.vectors.size()
         sample_size = min(sample_size, count)
+        # This should be much more clever about selection
         sample = self.vectors[0:sample_size]
-        queue = initial_queue(sample, self.configuration)
 
-        closest_vectors(sample, queue, self.vectors, self.beams, self.configuration)
-        # print_timestamp("closest vectors calculated")
-        expected = torch.arange(sample_size)
-        actual = queue.indices.t()[0]
-        found = (expected == actual).sum().item()
-
+        return ann_calculate_recall(
+            self.vectors, self.beams, self.configuration, sample
+        )
         return (found, found / sample_size)
 
     def clusters(self):

@@ -8,8 +8,7 @@ import numba
 from typing import Optional, Tuple
 
 from .constants import PRIMES, MAXINT, MAXFLOAT, DEVICE
-from .utils import index_by_tensor
-from .logging import log_time
+from .log import log_time
 
 
 def numba_current_stream():
@@ -398,7 +397,7 @@ def dedup_tensor_pair_(ids: Tensor, distances: Tensor):
     punchout_pair_kernel[grid, block, numba_current_stream(), 0](ids, distances)
 
 
-def punch_out_duplicates_(ids: Tensor, distances: Tensor):
+def punchout_duplicates_(ids: Tensor, distances: Tensor):
     dedup_tensor_pair_(ids, distances)
     (distances, perm) = distances.sort()
     ids = index_by_tensor(ids, perm)
@@ -503,7 +502,7 @@ def punchout_excluded_(indices, distances, exclusions):
 
 
 @cuda.jit(void(int32[:, ::1], float32[:, ::1]))
-def symmetrize_kernel(beams, distances, output_beams, output_distances):
+def symmetrize_kernel(beams, distances):
     pass
 
 
@@ -522,3 +521,12 @@ def symmetrize(beams: Tensor, distances: Tensor) -> Tuple[Tensor, Tensor]:
     symmetrize_kernel[grid, block, numba_current_stream(), 0](
         beams, distances, output_beams, output_distances
     )
+
+
+# NOTE: Potentially can be made a kernel
+def index_by_tensor(a: Tensor, b: Tensor):
+    dim1, dim2 = a.size()
+    a = a[
+        torch.arange(dim1).unsqueeze(1).expand((dim1, dim2)).flatten(), b.flatten()
+    ].view(dim1, dim2)
+    return a
