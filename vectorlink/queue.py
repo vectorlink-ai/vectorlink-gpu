@@ -1,6 +1,7 @@
 from torch import Tensor
 import torch
 from typing import Optional
+
 from .constants import MAXINT, MAXFLOAT
 from .kernels import punchout_excluded_, calculate_distances, punch_out_duplicates_
 from .utils import primes, generate_circulant_beams
