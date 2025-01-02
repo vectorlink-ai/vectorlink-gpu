@@ -501,26 +501,51 @@ def punchout_excluded_(indices, distances, exclusions):
     )
 
 
-@cuda.jit(void(int32[:, ::1], float32[:, ::1]))
-def symmetrize_kernel(beams, distances):
-    pass
+@cuda.jit(void(int32[:, ::1]), int32[:, ::1])
+def symmetrize_beams_kernel(beams, candidates):
+    shared = numba.cuda.shared.array(1, float32)
+    full_queue_size = beams.shape[1]
+    queue_size = int(full_queue_size / 3)
+
+    shared[0] = 0
+    write_queue_size = candidates.shape[1]
+
+    node_id = cuda.blockIdx.x
+    queue_group = cuda.blockIdx.y
+    queue_group_size = cuda.blockDim.x
+    queue_group_idx = cuda.threadIdx.x
+
+    numba.cuda.syncwarp(mask=0xFFFFFFFF)
+    for i in range(0, vector_count):
+        if i == node_id:
+            continue
+        j = queue_group * queue_group_size + queue_group_idx
+        if beams[i, j] == node_id:
+            offset = shared[0]
+            if offset >= write_queue_size:
+                return
+            candidates[node_id, offset] = i
+            shared[0] += 1
+            numba.cuda.syncwarp(mask=0xFFFFFFFF)
 
 
-def symmetrize(beams: Tensor, distances: Tensor) -> Tuple[Tensor, Tensor]:
+def symmetrize_beams(beams: Tensor) -> Tensor:
     """
     creates an approximate symmetrization for the graph.
 
     For a given node_id, scan the beams for this node_id, and add each beam origin which contains it.
 
     """
-    (batch_size, queue_size) = beams.size()
-    queue_groups = int((queue_size + 1023) / 1024)
-    queue_idx_size = int((queue_size + queue_groups - 1) / queue_groups)
-    grid = (batch_size, 1, 1)
-    block = (queue_idx_size, 1, 1)
-    symmetrize_kernel[grid, block, numba_current_stream(), 0](
-        beams, distances, output_beams, output_distances
-    )
+    (vector_count, queue_size) = beams.size()
+    queue_group_size = 32
+    third = int(queue_size / 3)
+    partial_queue_size = third
+    queue_groups = int((partial_queue_size + queue_group_size - 1) / queue_group_size)
+    grid = (vector_count, queue_groups, 1)
+    block = (queue_group_size, 1, 1)
+    candidates = torch.empty((vector_count, third))
+    symmetrize_beams_kernel[grid, block, numba_current_stream(), 0](beams, candidates)
+    return candidates
 
 
 # NOTE: Potentially can be made a kernel

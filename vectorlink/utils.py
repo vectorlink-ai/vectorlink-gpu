@@ -1,7 +1,13 @@
 from torch import Tensor
 import torch
 from .constants import PRIMES, DEVICE, DEBUG, MAXINT
-from .kernels import punchout_duplicates_, dedup_tensor_, index_by_tensor
+from .kernels import (
+    punchout_duplicates_,
+    dedup_tensor_,
+    index_by_tensor,
+    symmetrize_beams,
+    calculate_distances,
+)
 
 import time
 
@@ -72,3 +78,15 @@ def dedup_sort(tensor: Tensor):
     dedup_tensor_(tensor)
     (tensor, _) = tensor.sort()
     return tensor
+
+
+def symmetrize(vectors: Tensor, beams: Tensor, distances: Tensor):
+    candidates = symmetrize_beams(beams)
+    candidate_distances = calculate_distances(vectors, candidates)
+    (_, queue_size) = candidates.size()
+    (_, write_queue_size) = candidates.size()
+    distances_tail = distances.narrow(
+        1, queue_size - write_queue_size, write_queue_size
+    )
+    distances_tail.copy_(candidate_distances)
+    return queue_sort(beams, distances)
