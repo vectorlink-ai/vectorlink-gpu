@@ -1,11 +1,13 @@
 [project]
-name = "torch-hnsw"
+name = "vectorlink"
 version = "0.1.0"
-description = "get torch installed"
+description = "vectorlink pipeline tools"
 requires-python = ">=3.12"
 dependencies = [
     "torch==2.5.0",
     "numba==0.61rc1",
+    "datafusion>=43.1.0",
+    "pyarrow>=18.1.0",
 ]
 
 [build-system]
