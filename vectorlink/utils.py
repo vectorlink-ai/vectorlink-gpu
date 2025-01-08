@@ -5,7 +5,7 @@ from .kernels import (
     punchout_duplicates_,
     dedup_tensor_,
     index_by_tensor,
-    symmetrize_beams,
+    #symmetrize_beams,
     calculate_distances,
 )
 
@@ -80,6 +80,7 @@ def dedup_sort(tensor: Tensor):
     return tensor
 
 
+'''
 def symmetrize(vectors: Tensor, beams: Tensor, distances: Tensor):
     candidates = symmetrize_beams(beams)
     candidate_distances = calculate_distances(vectors, candidates)
@@ -90,3 +91,4 @@ def symmetrize(vectors: Tensor, beams: Tensor, distances: Tensor):
     )
     distances_tail.copy_(candidate_distances)
     return queue_sort(beams, distances)
+'''

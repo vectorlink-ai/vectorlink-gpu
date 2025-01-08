@@ -500,10 +500,11 @@ def punchout_excluded_(indices, distances, exclusions):
         indices, distances, exclusions
     )
 
-
-@cuda.jit(void(int32[:, ::1]), int32[:, ::1])
+'''
+@cuda.jit(void(int32[:, ::1], int32[:, ::1]))
 def symmetrize_beams_kernel(beams, candidates):
     shared = numba.cuda.shared.array(1, float32)
+    vector_count = beams.shape[0]
     full_queue_size = beams.shape[1]
     queue_size = int(full_queue_size / 3)
 
@@ -515,7 +516,7 @@ def symmetrize_beams_kernel(beams, candidates):
     queue_group_size = cuda.blockDim.x
     queue_group_idx = cuda.threadIdx.x
 
-    numba.cuda.syncwarp(mask=0xFFFFFFFF)
+    numba.cuda.syncwarp(0xFFFFFFFF)
     for i in range(0, vector_count):
         if i == node_id:
             continue
@@ -526,7 +527,7 @@ def symmetrize_beams_kernel(beams, candidates):
                 return
             candidates[node_id, offset] = i
             shared[0] += 1
-            numba.cuda.syncwarp(mask=0xFFFFFFFF)
+            numba.cuda.syncwarp(0xFFFFFFFF)
 
 
 def symmetrize_beams(beams: Tensor) -> Tensor:
@@ -546,6 +547,7 @@ def symmetrize_beams(beams: Tensor) -> Tensor:
     candidates = torch.empty((vector_count, third))
     symmetrize_beams_kernel[grid, block, numba_current_stream(), 0](beams, candidates)
     return candidates
+'''
 
 
 # NOTE: Potentially can be made a kernel
