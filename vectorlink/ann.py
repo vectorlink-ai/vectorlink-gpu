@@ -344,7 +344,7 @@ class ANN:
         torch.set_default_device(DEVICE)
         torch.set_float32_matmul_precision("high")
 
-        self.configuration = {
+        self.configuration: Dict = {
             "vector_count": count,
             "vector_dimension": dim,
             "prune": prune,
@@ -359,7 +359,11 @@ class ANN:
             "speculative_readahead": speculative_readahead,
         }
         self.vectors = vectors
+        wall_start = time.time()
         (self.beams, self.distances) = generate_ann(self.vectors, self.configuration)
+        wall_end = time.time()
+        total_time: float = wall_end - wall_start
+        self.configuration["total_time"] = total_time
 
     def recall(self, sample_size: int = 1000) -> Tuple[float, float]:
         (count, _) = self.vectors.size()
@@ -370,7 +374,6 @@ class ANN:
         return ann_calculate_recall(
             self.vectors, self.beams, self.configuration, sample
         )
-        return (found, found / sample_size)
 
     def clusters(self):
         pass
@@ -393,5 +396,6 @@ class ANN:
         log["gpu_arch"] = gpu_arch.decode("utf-8").strip()
         commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"])
         log["commit"] = commit.decode("utf-8").strip()
-        (_, recall) = self.calculate_recall()
+        (_, recall) = self.recall()
+        log["recall"] = recall
         return log
