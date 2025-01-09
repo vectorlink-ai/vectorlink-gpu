@@ -339,14 +339,14 @@ class ANN:
         batch_size: int = 10_000,
         recall_search_queue_factor: int = 3,
         speculative_readahead: int = 5,
+        beams: Optional[Tensor] = None,
+        distances: Optional[Tensor] = None,
     ):
         (count, dim) = vectors.size()
         torch.set_default_device(DEVICE)
         torch.set_float32_matmul_precision("high")
 
         self.configuration: Dict = {
-            "vector_count": count,
-            "vector_dimension": dim,
             "prune": prune,
             "beam_size": beam_size,
             "parallel_visit_count": parallel_visit_count,
@@ -360,10 +360,20 @@ class ANN:
         }
         self.vectors = vectors
         wall_start = time.time()
-        (self.beams, self.distances) = generate_ann(self.vectors, self.configuration)
+        if beams is not None:
+            self.beams = beams
+            if distances is None:
+                self.distances = calculate_distances(self.vectors, self.beams)
+            else:
+                self.distances = distances
+        else:
+            (self.beams, self.distances) = generate_ann(self.vectors, self.configuration)
         wall_end = time.time()
         total_time: float = wall_end - wall_start
-        self.configuration["total_time"] = total_time
+        self.log = self.configuration.copy()
+        self.log["total_time"] = total_time
+        self.log["vector_count"] = count
+        self.log["vector_dimension"] = dim
 
     def recall(self, sample_size: int = 1000) -> Tuple[float, float]:
         (count, _) = self.vectors.size()
@@ -390,7 +400,7 @@ class ANN:
 
     def dump_logs(self) -> Dict:
         global CLOSEST_VECTORS_BATCH_TIME
-        log = self.configuration.copy()
+        log = self.log.copy()
         log["closest_vectors_batch_time"] = CLOSEST_VECTORS_BATCH_TIME
         gpu_arch = subprocess.check_output(["nvidia-smi", "-L"])
         log["gpu_arch"] = gpu_arch.decode("utf-8").strip()
