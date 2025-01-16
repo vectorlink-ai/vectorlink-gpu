@@ -3,7 +3,9 @@ from numba import cuda
 from datafusion import SessionContext, DataFrame
 from datafusion.object_store import AmazonS3, LocalFileSystem, GoogleCloud
 import numpy as np
+import pyarrow as pa
 import ctypes
+import torch
 
 
 def build_session_context(bucket_name: str) -> SessionContext:
@@ -39,3 +41,9 @@ def dataframe_to_tensor(df: DataFrame, tensor: Tensor):
         cuda_slice = cuda_array[offset : offset + len(embeddings)]
         cuda_slice.copy_to_device(embeddings_numpy)
         offset += len(embeddings)
+
+
+def tensor_to_arrow(tensor: Tensor, field_name) -> pa.Table:
+    return pa.Table.from_pydict(
+        {field_name: pa.array(np.unstack(tensor.cpu().detach().numpy()))}
+    )
