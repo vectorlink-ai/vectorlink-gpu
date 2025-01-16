@@ -43,7 +43,5 @@ def dataframe_to_tensor(df: DataFrame, tensor: Tensor):
         offset += len(embeddings)
 
 
-def tensor_to_arrow(tensor: Tensor, field_name) -> pa.Table:
-    return pa.Table.from_pydict(
-        {field_name: pa.array(np.unstack(tensor.cpu().detach().numpy()))}
-    )
+def tensor_to_arrow(tensor: Tensor) -> pa.Array:
+    return pa.array(np.unstack(tensor.cpu().detach().numpy()))
