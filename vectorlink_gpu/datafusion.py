@@ -22,7 +22,7 @@ def build_local_session_context(directory: str) -> SessionContext:
     return context
 
 
-def dataframe_to_tensor(tensor: Tensor, df: DataFrame):
+def dataframe_to_tensor(df: DataFrame, tensor: Tensor):
     # assuming 1536 length floats. this needs to be more properly done later
     # also assuming that the incoming dataframe is sorted!
     cuda_array = cuda.as_cuda_array(tensor)
