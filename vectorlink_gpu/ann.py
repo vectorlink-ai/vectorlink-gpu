@@ -434,7 +434,7 @@ class ANN:
         """
         Search takes a query tensor, structured as a batch of vectors to search - it returns a Queue object.
         """
-        search_queue = initial_queue(query, self.configuration)
+        search_queue = initial_queue(self.vectors, self.configuration)
         closest_vectors(
             query, search_queue, self.vectors, self.beams, self.configuration, None
         )
