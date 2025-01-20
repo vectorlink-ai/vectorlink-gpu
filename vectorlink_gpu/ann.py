@@ -226,8 +226,7 @@ def initial_search_queue(vectors: Tensor, query_vectors: Tensor, config: Dict):
     initial_queue_indices = generate_queue_circulants(batch_size, vector_count, p)
 
     starting_vectors = vectors[initial_queue_indices]
-    query_vectors * starting_vectors
-    d = query_cosine_distances(query_vectors, initial_queue_indices)
+    d = query_cosine_distances(query_vectors, starting_vectors)
     queue.insert(initial_queue_indices, d)
 
     return queue
