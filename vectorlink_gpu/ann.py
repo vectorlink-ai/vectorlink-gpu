@@ -207,6 +207,21 @@ def initial_queue(vectors: Tensor, config: Dict):
     return queue
 
 
+def initial_search_queue(vectors: Tensor, query_vectors: Tensor, config: Dict):
+    queue_size = config["recall_search_queue_factor"] * config["beam_size"]
+    (batch_size, _) = query_vectors.size()
+    extra_capacity = max(
+        queue_size, config["parallel_visit_count"] * config["beam_size"]
+    )
+    queue = Queue(batch_size, queue_size, queue_size + extra_capacity)
+    p = primes(queue_size)
+    initial_queue_indices = generate_circulant_beams(batch_size, p)
+    d = calculate_distances(query_vectors, initial_queue_indices)
+    queue.insert(initial_queue_indices, d)
+
+    return queue
+
+
 def ann_calculate_recall(
     vectors: Tensor,
     beams: Tensor,
@@ -434,7 +449,7 @@ class ANN:
         """
         Search takes a query tensor, structured as a batch of vectors to search - it returns a Queue object.
         """
-        search_queue = initial_queue(self.vectors, self.configuration)
+        search_queue = initial_search_queue(self.vectors, query, self.configuration)
         closest_vectors(
             query, search_queue, self.vectors, self.beams, self.configuration, None
         )
