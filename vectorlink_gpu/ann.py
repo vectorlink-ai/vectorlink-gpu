@@ -25,6 +25,7 @@ from .kernels import (
 from .utils import (
     index_sort,
     generate_circulant_beams,
+    generate_queue_circulants,
     generate_random_vectors,
     primes,
     add_new_to_seen_,
@@ -207,6 +208,12 @@ def initial_queue(vectors: Tensor, config: Dict):
     return queue
 
 
+def query_cosine_distances(q1: Tensor, q2: Tensor):
+    m = q1 * q2
+    cos_theta = m.sum(dim=2)
+    return (1 - cos_theta) / 2
+
+
 def initial_search_queue(vectors: Tensor, query_vectors: Tensor, config: Dict):
     queue_size = config["recall_search_queue_factor"] * config["beam_size"]
     (batch_size, _) = query_vectors.size()
@@ -215,8 +222,12 @@ def initial_search_queue(vectors: Tensor, query_vectors: Tensor, config: Dict):
     )
     queue = Queue(batch_size, queue_size, queue_size + extra_capacity)
     p = primes(queue_size)
-    initial_queue_indices = generate_circulant_beams(batch_size, p)
-    d = calculate_distances(query_vectors, initial_queue_indices)
+    (vector_count, _) = vectors.size()
+    initial_queue_indices = generate_queue_circulants(batch_size, vector_count, p)
+
+    starting_vectors = vectors[initial_queue_indices]
+    query_vectors * starting_vectors
+    d = query_cosine_distances(query_vectors, initial_queue_indices)
     queue.insert(initial_queue_indices, d)
 
     return queue

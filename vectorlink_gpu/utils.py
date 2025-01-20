@@ -5,7 +5,7 @@ from .kernels import (
     punchout_duplicates_,
     dedup_tensor_,
     index_by_tensor,
-    #symmetrize_beams,
+    # symmetrize_beams,
     calculate_distances,
 )
 
@@ -21,6 +21,15 @@ def generate_random_vectors(number_of_vectors: int, dimensions: int = 1536) -> T
 
 def primes(size: int):
     return PRIMES.narrow(0, 0, size)
+
+
+def generate_queue_circulants(batch_size: int, num_vecs: int, primes: Tensor) -> Tensor:
+    (queue_size,) = primes.size()
+    indices = torch.arange(queue_size, device=DEVICE, dtype=torch.int32)
+    repeated_indices = indices.expand(queue_size, batch_size).transpose(0, 1)
+    repeated_primes = primes.expand(batch_size, queue_size)
+    circulant_neighbors = repeated_indices + repeated_primes
+    return circulant_neighbors.sort().values % num_vecs
 
 
 def generate_circulant_beams(num_vecs: int, primes: Tensor) -> Tensor:
@@ -80,7 +89,7 @@ def dedup_sort(tensor: Tensor):
     return tensor
 
 
-'''
+"""
 def symmetrize(vectors: Tensor, beams: Tensor, distances: Tensor):
     candidates = symmetrize_beams(beams)
     candidate_distances = calculate_distances(vectors, candidates)
@@ -91,4 +100,4 @@ def symmetrize(vectors: Tensor, beams: Tensor, distances: Tensor):
     )
     distances_tail.copy_(candidate_distances)
     return queue_sort(beams, distances)
-'''
+"""
