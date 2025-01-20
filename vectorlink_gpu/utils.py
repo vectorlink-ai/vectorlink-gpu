@@ -25,7 +25,7 @@ def primes(size: int):
 
 def generate_queue_circulants(batch_size: int, num_vecs: int, primes: Tensor) -> Tensor:
     (queue_size,) = primes.size()
-    indices = torch.arange(queue_size, device=DEVICE, dtype=torch.int32)
+    indices = torch.arange(batch_size, device=DEVICE, dtype=torch.int32)
     repeated_indices = indices.expand(queue_size, batch_size).transpose(0, 1)
     repeated_primes = primes.expand(batch_size, queue_size)
     circulant_neighbors = repeated_indices + repeated_primes
