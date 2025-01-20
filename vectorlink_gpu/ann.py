@@ -1,4 +1,5 @@
-from typing import List, Optional, Tuple
+from __future__ import annotations
+from typing import List, Optional, Tuple, Type
 from torch import Tensor
 import torch
 from torch import profiler
@@ -10,6 +11,7 @@ import subprocess
 from typing import Dict
 import json
 import time
+import datafusion as df
 
 from .constants import MAXINT, MAXFLOAT, DEVICE
 from .queue import Queue
@@ -28,6 +30,7 @@ from .utils import (
     add_new_to_seen_,
 )
 from .log import log_time, CLOSEST_VECTORS_BATCH_TIME
+from .datafusion import dataframe_to_tensor
 
 
 @log_time
@@ -367,13 +370,52 @@ class ANN:
             else:
                 self.distances = distances
         else:
-            (self.beams, self.distances) = generate_ann(self.vectors, self.configuration)
+            (self.beams, self.distances) = generate_ann(
+                self.vectors, self.configuration
+            )
         wall_end = time.time()
         total_time: float = wall_end - wall_start
         self.log = self.configuration.copy()
         self.log["total_time"] = total_time
         self.log["vector_count"] = count
         self.log["vector_dimension"] = dim
+
+    def load_from_dataframe(dataframe: df.DataFrame, **kwargs) -> ANN:
+        "dataframe should have a vector_id, embedding and beams column, and an optional distances column"
+        count = dataframe.count()
+        assert "embedding" in dataframe.schema().names
+        embedding_size = len(
+            dataframe.select(df.col("embedding")).head(1).collect()[0]["embedding"][0]
+        )
+        assert "beams" in dataframe.schema().names
+        beam_size = len(
+            dataframe.select(df.col("beams")).head(1).collect()[0]["beams"][0]
+        )
+
+        dataframe = dataframe.sort(df.col("vector_id"))
+
+        vectors_tensor = torch.empty(
+            (count, embedding_size), dtype=torch.float32, device="cuda"
+        )
+        dataframe_to_tensor(dataframe.select(df.col("embedding")), vectors_tensor)
+
+        beams_tensor = torch.empty((count, beam_size), dtype=torch.int32, device="cuda")
+        dataframe_to_tensor(dataframe.select(df.col("beams")), beams_tensor)
+
+        distances_tensor = None
+        if "distances" in dataframe.schema().names:
+            distances_tensor = torch.empty(
+                (count, beam_size), dtype=torch.float32, device="cuda"
+            )
+            dataframe_to_tensor(dataframe.select(df.col("distances")), distances_tensor)
+
+        return ANN(
+            vectors_tensor,
+            beam_size=beam_size,
+            beams=beams_tensor,
+            distances=distances_tensor,
+            **kwargs,
+        )
 
     def recall(self, sample_size: int = 1000) -> Tuple[float, float]:
         (count, _) = self.vectors.size()
