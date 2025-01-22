@@ -34,8 +34,7 @@ def dtype_to_ctype(dtype):
 
 
 def dataframe_to_tensor(df: DataFrame, tensor: Tensor):
-    # assuming 1536 length floats. this needs to be more properly done later
-    # also assuming that the incoming dataframe is sorted!
+    # assuming that the incoming dataframe is sorted!
     cuda_array = cuda.as_cuda_array(tensor)
     stream = df.execute_stream()
     offset = 0
@@ -43,7 +42,7 @@ def dataframe_to_tensor(df: DataFrame, tensor: Tensor):
     for batch in stream:
         embeddings = batch.to_pyarrow().column(0)
         embeddings_ptr = ctypes.cast(
-            embeddings.buffers()[3].address, ctypes.POINTER(ctype)
+            embeddings.buffers()[-1].address, ctypes.POINTER(ctype)
         )
         embeddings_numpy = np.ctypeslib.as_array(
             embeddings_ptr, (len(embeddings), tensor.size()[1])
