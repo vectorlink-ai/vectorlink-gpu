@@ -40,6 +40,7 @@ def dataframe_to_tensor(df: DataFrame, tensor: Tensor):
     offset = 0
     ctype = dtype_to_ctype(tensor.dtype)
     for batch in stream:
+        # TODO: this should not be a index lookup but a lookup by column name
         embeddings = batch.to_pyarrow().column(0)
         embeddings_ptr = ctypes.cast(
             embeddings.buffers()[-1].address, ctypes.POINTER(ctype)

@@ -224,8 +224,14 @@ def initial_search_queue(vectors: Tensor, query_vectors: Tensor, config: Dict):
     p = primes(queue_size)
     (vector_count, _) = vectors.size()
     initial_queue_indices = generate_queue_circulants(batch_size, vector_count, p)
+    print(batch_size)
+    print(vector_count)
+    print(queue_size)
+    print(initial_queue_indices.size())
 
     starting_vectors = vectors[initial_queue_indices]
+    print(query_vectors.size())
+    print(starting_vectors.size())
     d = query_cosine_distances(query_vectors, starting_vectors)
     queue.insert(initial_queue_indices, d)
 
