@@ -1,5 +1,7 @@
 # VectorLink.py
 
+All rights reserved © Data Chemist Limited 2025.
+
 VectorLink.py is a python library that exposes tools for managing vectors at scale. It is part of the VectorLink pipeline.
 
 ## Requirements
