@@ -209,8 +209,9 @@ def initial_queue(vectors: Tensor, config: Dict):
 
 
 def query_cosine_distances(q1: Tensor, q2: Tensor):
-    m = q1 * q2
-    cos_theta = m.sum(dim=2)
+    transposed = q2.transpose(0,1)
+    m = q1 * transposed
+    cos_theta = m.sum(dim=2).transpose(0,1)
     return (1 - cos_theta) / 2
 
 
