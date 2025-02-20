@@ -405,13 +405,24 @@ class ANN:
         self.log["vector_count"] = count
         self.log["vector_dimension"] = dim
 
-    def load_from_dataframe(dataframe: df.DataFrame, **kwargs) -> ANN:
+    @classmethod
+    def load_from_dataframe(cls, dataframe: df.DataFrame, **kwargs) -> ANN:
         "dataframe should have a vector_id, embedding and beams column, and an optional distances column"
         count = dataframe.count()
         assert "embedding" in dataframe.schema().names
-        embedding_size = len(
-            dataframe.select(df.col("embedding")).head(1).collect()[0]["embedding"][0]
+        # the embedding can either be a fixed size array, in which case we can get the size from the schema, or it is a dynamically sized array in which case we get the size from the first element and assume all others are like that too.
+        sch = dataframe.schema()
+        embedding_size = getattr(
+            sch.field(sch.get_field_index("embedding")),
+            "list_size",
+            None,
         )
+        if embedding_size is None:
+            embedding_size = len(
+                dataframe.select(df.col("embedding"))
+                .head(1)
+                .collect()[0]["embedding"][0]
+            )
         assert "beams" in dataframe.schema().names
         beam_size = len(
             dataframe.select(df.col("beams")).head(1).collect()[0]["beams"][0]
